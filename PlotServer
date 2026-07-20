@@ -1,8 +1,11 @@
 --[[
-	PlotSystemServer v9.3 (Script)
+	PlotSystemServer v9.7 (Script)
 	LOCATION: ServerScriptService - paste over the previous version
 
-	New in v9.3:
+	New in v9.7:
+	  - Wall copies and moved walls snap/sew at final resize/drop commit
+
+	Carried forward from v9.3:
 	  - One canonical saved wallet for build shop, admin grants and purchases
 	  - Wallet attribute + leaderboard mirror update immediately
 	  - Roof server applies grid/edge exactly once
@@ -1797,6 +1800,39 @@ buildRemote.OnServerInvoke = function(player, payload)
 		local prx = math.rad(math.round(math.deg(tonumber(payload.rx) or 0) / 15) * 15)
 		local prz = math.rad(math.round(math.deg(tonumber(payload.rz) or 0) / 15) * 15)
 		local newCF = CFrame.new(pos) * CFrame.fromOrientation(prx, rot, prz)
+
+		-- v9.7 WALL SEAMING: when a WALL is committed (dragged, dropped, or a
+		-- copy being placed), snap its ENDPOINTS to the grid and re-sew ±half
+		-- thickness, exactly like a freshly-drawn wall. Without this, a dropped
+		-- copy kept its old length at an off-grid spot, so corners left a gap.
+		-- Only applies to upright axis-aligned walls (the normal case); tilted
+		-- walls (rx/rz set) are left exactly where the player put them.
+		if model.Name == "__Wall" and math.abs(prx) < 0.01 and math.abs(prz) < 0.01 then
+			local pl = plots[idx]
+			local axisW = newCF.LookVector
+			local halfLen = sz / 2
+			local sew = WALL_THICKNESS / 2
+			-- current endpoints, minus the existing sew, = true grid endpoints
+			local aW = newCF.Position - axisW * (halfLen - sew)
+			local bW = newCF.Position + axisW * (halfLen - sew)
+			local function snapEnd(p)
+				local rel = pl.CFrame:PointToObjectSpace(p)
+				rel = Vector3.new(math.round(rel.X / GRID) * GRID, rel.Y,
+					math.round(rel.Z / GRID) * GRID)
+				return pl.CFrame:PointToWorldSpace(rel)
+			end
+			aW, bW = snapEnd(aW), snapEnd(bW)
+			local dir = bW - aW
+			if dir.Magnitude >= 0.5 then
+				local axis2 = dir.Unit
+				aW = aW - axis2 * sew
+				bW = bW + axis2 * sew
+				sz = (bW - aW).Magnitude
+				local mid = Vector3.new((aW.X + bW.X) / 2, pos.Y, (aW.Z + bW.Z) / 2)
+				newCF = CFrame.lookAt(mid, Vector3.new(bW.X, pos.Y, bW.Z))
+			end
+		end
+
 		if not boxWithinPlot(idx, newCF, Vector3.new(sx, sy, sz)) then
 			return false, "Keep it inside your plot!"
 		end
@@ -1944,18 +1980,9 @@ buildRemote.OnServerInvoke = function(player, payload)
 			if not (tonumber(payload.x) and tonumber(payload.y) and tonumber(payload.z)) then
 				structCF = part.CFrame + (newCF.Position - model:GetPivot().Position)
 			end
-			-- v9.3: a copied WALL re-snaps its centre to the grid and keeps the
-			-- same sewn length, so it stitches into corners exactly like a
-			-- freshly-drawn wall instead of inheriting a stale offset.
 			local copySize = part.Size
-			if model.Name == "__Wall" then
-				local pl = plots[idx]
-				local rel = pl.CFrame:PointToObjectSpace(structCF.Position)
-				local snapped = Vector3.new(
-					math.round(rel.X / GRID) * GRID, rel.Y,
-					math.round(rel.Z / GRID) * GRID)
-				structCF = pl.CFrame:ToWorldSpace(CFrame.new(snapped)) * structCF.Rotation
-			end
+			-- Wall copies are grid-snapped + sewn on DROP, in the resize
+			-- handler, not here — cloning just duplicates in place.
 			local copy = spawnStructure(idx, STRUCT_KIND[model.Name], copySize,
 				structCF, part.Material.Name, part.Color,
 				part:IsA("WedgePart"))
