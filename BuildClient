@@ -57,9 +57,9 @@ local invRemote = S.findCanonical(ReplicatedStorage, "PlotInv", "RemoteEvent")
 local furnitureFolder = ReplicatedStorage:WaitForChild("Furniture", 10)
 local itemsRoot = S.findCanonical(workspace, "PlacedItems", "Folder")
 if not (buildRemote and invRemote and itemsRoot) then
-	error("[BuildClient v9.7] Missing canonical PlotBuild, PlotInv, or PlacedItems")
+	error("[BuildClient v10.2] Missing canonical PlotBuild, PlotInv, or PlacedItems")
 end
-print("[BuildClient v9.7] bound to " .. buildRemote:GetFullName()
+print("[BuildClient v10.2] bound to " .. buildRemote:GetFullName()
 	.. " and " .. itemsRoot:GetFullName())
 local RoofShapes = nil
 pcall(function()
@@ -1340,6 +1340,18 @@ local groupHandles = false
 local groupHandleStart = nil
 local handleGrab = false -- true while any Studio handle is being dragged
 local flying = false -- forward-declared so free-cam state is visible here
+
+-- v9.9: true whenever a finger-drag belongs to BUILDING (placing an item,
+-- drawing a wall/floor/roof, or moving a selection) rather than the camera.
+-- The mobile orbit camera checks this so it never fights the build gesture.
+S.isManipulating = function()
+	return S.structDragging == true
+		or mode == "ghost"
+		or dragSelActive == true
+		or groupDragActive == true
+		or handleGrab == true
+		or floatingCopies == true
+end
 
 local selModel = nil
 local selPlot = nil -- the plot Part the selected item lives on
@@ -4063,6 +4075,7 @@ S.beginStructureDrag = function()
 	structStart = Vector3.new(cx, p.Y, cz)
 	S.structEndX, S.structEndZ = cx, cz
 	S.structDragging = true
+	S.buildTouchActive = true -- suppress orbit for the duration of this drag
 
 	if mode == "wall" and S.wallMode == "box" then
 		structPreview = Instance.new("Model")
@@ -4458,6 +4471,7 @@ end)
 UserInputService.InputEnded:Connect(function(input)
 	if input.UserInputType == Enum.UserInputType.MouseButton1
 		or input.UserInputType == Enum.UserInputType.Touch then
+		S.buildTouchActive = false -- release orbit suppression
 		if S.structDragging then S.commitStructureDrag() end
 		S.stampHeld = false
 		if groupDragActive then
@@ -4893,6 +4907,7 @@ function S.initializeLateBuildUI()
 	end
 
 	U.flyBtn.MouseButton1Click:Connect(function() setFlying(not flying) end)
+	S.forceLandRef = function() setFlying(false) end
 
 	S.freeCamSpeeds = { 10, 20, 35, 50, 75, 100 }
 	S.freeCamSpeedIndex = 3
@@ -4987,18 +5002,36 @@ function S.initializeLateBuildUI()
 		-- camera.
 		local mobileOrbit = S.isMobileLayout and S.isMobileLayout() and U.dock.Visible
 		if not (flying or mobileOrbit) or gameProcessed then return end
-		-- v9.7: mobile orbit is much gentler than desktop free-look - a
-		-- touchscreen drag covers far more angle per pixel, so 0.006 felt
-		-- uncontrollably fast. 0.0022 lands close to Bloxburg's feel.
-		local sens = mobileOrbit and 0.0022 or 0.006
-		camYaw -= touch.Delta.X * sens
-		camPitch = math.clamp(camPitch - touch.Delta.Y * sens, -1.4, 1.4)
+		-- v10.2: hard isolation. A single finger orbits ONLY when no build tool
+		-- is active AND no build gesture is in progress. When a tool is up, the
+		-- finger belongs to building; the camera moves with two fingers.
+		if mobileOrbit and (mode ~= nil
+			or S.buildTouchActive == true
+			or (S.isManipulating and S.isManipulating())) then
+			return
+		end
+		if mobileOrbit then
+			-- single finger = HORIZONTAL orbit only (yaw). CLAMP the per-event
+			-- change so a fast flick can't throw the camera across the map
+			-- (touch velocity spikes were the "hyper-speed" symptom).
+			local dYaw = math.clamp(touch.Delta.X * 0.0007, -0.06, 0.06)
+			camYaw -= dYaw
+		else
+			local sens = 0.006
+			camYaw -= touch.Delta.X * sens
+			camPitch = math.clamp(camPitch - touch.Delta.Y * sens, -1.4, 1.4)
+		end
 	end)
 
 	-- The per-frame camera step. v9: this is CONNECTED only while flying
 	-- and disconnected on landing (no idle per-frame work, ever).
 	local camConn = nil
 	local function camStep(dt)
+		-- v10.1: under the mobile LAYOUT the orbit rig owns the camera. If this
+		-- free-cam loop is somehow still connected, do nothing - two camera
+		-- systems writing camera.CFrame is what made a single finger appear to
+		-- move the camera during a wall drag.
+		if S.isMobileLayout and S.isMobileLayout() then return end
 		-- look while holding right mouse
 		if UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
 			UserInputService.MouseBehavior = Enum.MouseBehavior.LockCurrentPosition
@@ -5375,6 +5408,24 @@ function S.initializeLateBuildUI()
 		local orbitFocus = Vector3.zero
 		local orbitDist = 42
 		local orbitConn = nil
+		-- v9.8 CAMERA: remember the plot so we can CLAMP the focus and distance
+		-- to the plot area + a margin. Without this the camera flew off into
+		-- the distance (the user's "pushes you off too far").
+		local orbitPlot = nil
+		local ORBIT_MARGIN = 6 -- studs beyond the plot edge (small: keeps other
+		-- players' plots out of view while giving a little breathing room)
+
+		local function clampFocus()
+			if not orbitPlot then return end
+			local rel = orbitPlot.CFrame:PointToObjectSpace(orbitFocus)
+			local hx = orbitPlot.Size.X / 2 + ORBIT_MARGIN
+			local hz = orbitPlot.Size.Z / 2 + ORBIT_MARGIN
+			rel = Vector3.new(
+				math.clamp(rel.X, -hx, hx),
+				rel.Y,
+				math.clamp(rel.Z, -hz, hz))
+			orbitFocus = orbitPlot.CFrame:PointToWorldSpace(rel)
+		end
 
 		local function orbitStep()
 			local rot = CFrame.fromEulerAnglesYXZ(camPitch, camYaw, 0)
@@ -5383,7 +5434,12 @@ function S.initializeLateBuildUI()
 		end
 
 		local function startOrbitCam()
+			-- v10.1: orbit is authoritative on mobile - make sure the old
+			-- free-cam (WASD/fly) loop is fully OFF, or both camera systems run
+			-- at once and a single drag appears to move the camera even mid-build.
+			if flying and S.forceLandRef then S.forceLandRef() end
 			local plot = myPlotPart()
+			orbitPlot = plot
 			if plot then
 				orbitFocus = plot.Position + Vector3.new(0, WALL_HEIGHT * 0.5, 0)
 				orbitDist = math.clamp(plot.Size.Magnitude * 0.5, 24, 90)
@@ -5399,25 +5455,41 @@ function S.initializeLateBuildUI()
 		end
 		local function stopOrbitCam()
 			if orbitConn then orbitConn:Disconnect() orbitConn = nil end
+			orbitPlot = nil
 			camera.CameraType = Enum.CameraType.Custom
 		end
 
-		-- Pinch to zoom + two-finger pan. TouchMoved (single finger) already
-		-- orbits via the free-cam handler; we only add multi-touch here.
+		-- Pinch to zoom, two-finger PAN moves the focus, two-finger TWIST
+		-- rotates the view - matching Bloxburg's mobile camera. Single-finger
+		-- drag orbits via the free-cam TouchMoved handler above (gentle sens).
 		UserInputService.TouchPinch:Connect(function(_, scale, _, state)
 			if not (isMobileLayout() and U.dock.Visible and orbitConn) then return end
 			if state == Enum.UserInputState.Change then
-				orbitDist = math.clamp(orbitDist / math.clamp(scale, 0.5, 2), 12, 140)
+				-- v10: wider zoom band (8..160) and a gentler per-event step so
+				-- pinch has real range instead of feeling capped. scale is the
+				-- ratio of current/previous finger spread.
+				local step = math.clamp(scale, 0.85, 1.15)
+				orbitDist = math.clamp(orbitDist / step, 8, 160)
+			end
+		end)
+		UserInputService.TouchRotate:Connect(function(_, rotation, _, state)
+			if not (isMobileLayout() and U.dock.Visible and orbitConn) then return end
+			if state == Enum.UserInputState.Change then
+				-- two-finger twist spins the camera yaw, clamped per event
+				camYaw -= math.clamp(math.rad(rotation) * 0.4, -0.08, 0.08)
 			end
 		end)
 		UserInputService.TouchPan:Connect(function(_, totalTranslation, _, state)
 			if not (isMobileLayout() and U.dock.Visible and orbitConn) then return end
 			if state == Enum.UserInputState.Change then
-				-- pan the focus in the camera's ground plane
+				-- pan the focus in the camera's ground plane, then clamp to plot
 				local rot = CFrame.fromEulerAnglesYXZ(0, camYaw, 0)
 				local right = rot.RightVector
 				local fwd = rot.LookVector
-				orbitFocus -= (right * totalTranslation.X + fwd * -totalTranslation.Y) * 0.05
+				-- scale pan by distance so it feels consistent when zoomed
+				local k = 0.04 * (orbitDist / 42)
+				orbitFocus -= (right * totalTranslation.X + fwd * -totalTranslation.Y) * k
+				clampFocus()
 			end
 		end)
 
@@ -5465,4 +5537,4 @@ end
 
 S.initializeLateBuildUI()
 S.initializeLateBuildUI = nil
-print("[BuildClient v9.7] GUI initialized - responsive mobile layout, two-sided walls")
+print("[BuildClient v10.2] GUI initialized - responsive mobile layout, two-sided walls")
