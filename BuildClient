@@ -57,9 +57,9 @@ local invRemote = S.findCanonical(ReplicatedStorage, "PlotInv", "RemoteEvent")
 local furnitureFolder = ReplicatedStorage:WaitForChild("Furniture", 10)
 local itemsRoot = S.findCanonical(workspace, "PlacedItems", "Folder")
 if not (buildRemote and invRemote and itemsRoot) then
-	error("[BuildClient v9.5] Missing canonical PlotBuild, PlotInv, or PlacedItems")
+	error("[BuildClient v9.7] Missing canonical PlotBuild, PlotInv, or PlacedItems")
 end
-print("[BuildClient v9.5] bound to " .. buildRemote:GetFullName()
+print("[BuildClient v9.7] bound to " .. buildRemote:GetFullName()
 	.. " and " .. itemsRoot:GetFullName())
 local RoofShapes = nil
 pcall(function()
@@ -1575,6 +1575,9 @@ local function setMode(newMode)
 	floatingCopies = false
 	if clearBoxSelectionRef then clearBoxSelectionRef() end
 	U.hoverHighlight.Parent = nil
+	if S.hideGuidelines and newMode ~= "wall" and newMode ~= "floor" and newMode ~= "roof" then
+		S.hideGuidelines()
+	end
 	mode = newMode
 	if newMode ~= "select" then
 		S.stampMode, S.stampHeld = false, false
@@ -1785,6 +1788,49 @@ S.showWallSnapMarker = function(info)
 		info.position.Z
 	)
 	S.wallSnapMarker.Transparency = 0.05
+end
+
+-- v9.7 PLACEMENT GUIDELINES: two thin bright lines through the current
+-- placement point, spanning the plot, so wall/floor/roof edges are easy to
+-- line up on mobile (and helpful on PC too). Pooled - created once, moved
+-- and shown/hidden. Purely visual, on the client, never sent to the server.
+S.guideLines = nil
+S.showGuidelines = function(x, z, y)
+	if not S.guideLines then
+		S.guideLines = {}
+		for i = 1, 2 do
+			local line = Instance.new("Part")
+			line.Name = "BuildGuide" .. i
+			line.Anchored = true
+			line.CanCollide = false
+			line.CanTouch = false
+			line.CanQuery = false
+			line.CastShadow = false
+			line.Material = Enum.Material.Neon
+			line.Color = C.GOLD
+			line.Transparency = 0.35
+			line.Parent = camera
+			S.guideLines[i] = line
+		end
+	end
+	local plot = S.activePlot or myPlotPart()
+	if not plot then S.hideGuidelines() return end
+	local gy = (y or buildPlaneY() or plot.Position.Y) + 0.06
+	-- line 1 runs along the plot's X extent at this Z; line 2 along Z at this X
+	local along = plot.CFrame.RightVector
+	local across = plot.CFrame.LookVector
+	local lenX, lenZ = plot.Size.X, plot.Size.Z
+	local p = Vector3.new(x, gy, z)
+	S.guideLines[1].Size = Vector3.new(lenX, 0.08, 0.08)
+	S.guideLines[1].CFrame = CFrame.lookAt(p, p + across) * CFrame.Angles(0, math.rad(90), 0)
+	S.guideLines[2].Size = Vector3.new(0.08, 0.08, lenZ)
+	S.guideLines[2].CFrame = CFrame.lookAt(p, p + across)
+	for _, l in ipairs(S.guideLines) do l.Transparency = 0.35 end
+end
+S.hideGuidelines = function()
+	if S.guideLines then
+		for _, l in ipairs(S.guideLines) do l.Transparency = 1 end
+	end
 end
 
 S.snapWallPoint = function(x, z)
@@ -2645,6 +2691,17 @@ RunService.RenderStepped:Connect(function()
 		if not model then model = placedModelUnderMouse() end
 		-- paint mode highlights everything (furniture is paintable per-part)
 		U.hoverHighlight.Parent = model
+	elseif (mode == "wall" or mode == "floor" or mode == "roof") and not structStart then
+		-- Tool armed but not dragging yet: float the guidelines at the cursor so
+		-- you can line up where a wall/floor/roof will START.
+		local p = planePoint()
+		if p then
+			local cx, cz = snapStruct(p)
+			if mode == "wall" then cx, cz = S.snapWallPoint(cx, cz) end
+			S.showGuidelines(cx, cz, buildPlaneY())
+		else
+			S.hideGuidelines()
+		end
 	elseif (mode == "wall" or mode == "floor" or mode == "roof") and structStart then
 		local p = planePoint()
 		if p and structPreview then
@@ -2654,6 +2711,7 @@ RunService.RenderStepped:Connect(function()
 				cx, cz, roofEndSnapped = S.snapRoofPoint(cx, cz)
 			end
 			local planeY = buildPlaneY() or structStart.Y
+			S.showGuidelines(cx, cz, planeY) -- follow the moving endpoint
 			if mode == "wall" then
 				local dx, dz = cx - structStart.X, cz - structStart.Z
 				if S.wallMode == "line" then
@@ -4923,9 +4981,18 @@ function S.initializeLateBuildUI()
 
 	-- drag anywhere on empty screen to look around while flying
 	UserInputService.TouchMoved:Connect(function(touch, gameProcessed)
-		if not flying or gameProcessed then return end
-		camYaw -= touch.Delta.X * 0.006
-		camPitch = math.clamp(camPitch - touch.Delta.Y * 0.006, -1.4, 1.4)
+		-- Orbit on single-finger drag while flying (desktop free-cam on touch)
+		-- OR while the mobile orbit camera is active. gameProcessed is true when
+		-- the touch started on a button, so dragging the toolbar never spins the
+		-- camera.
+		local mobileOrbit = S.isMobileLayout and S.isMobileLayout() and U.dock.Visible
+		if not (flying or mobileOrbit) or gameProcessed then return end
+		-- v9.7: mobile orbit is much gentler than desktop free-look - a
+		-- touchscreen drag covers far more angle per pixel, so 0.006 felt
+		-- uncontrollably fast. 0.0022 lands close to Bloxburg's feel.
+		local sens = mobileOrbit and 0.0022 or 0.006
+		camYaw -= touch.Delta.X * sens
+		camPitch = math.clamp(camPitch - touch.Delta.Y * sens, -1.4, 1.4)
 	end)
 
 	-- The per-frame camera step. v9: this is CONNECTED only while flying
@@ -5043,11 +5110,12 @@ function S.initializeLateBuildUI()
 		U.timeBar.Visible = open
 		U.viewFrame.Visible = open
 		if open then
-			-- v9.3: mobile builders get free-cam ON by default the first time
-			-- they open build mode this session - dragging the world around a
-			-- fixed avatar is far easier than thumb-walking while placing walls.
-			-- (Only auto-armed once, so tapping Cam to land is respected after.)
-			if UserInputService.TouchEnabled and not S.autoFlewThisSession and not flying then
+			-- v9.6: the mobile LAYOUT now owns the camera via its orbit rig, so
+			-- the old auto-free-cam only applies when a touch device is using the
+			-- PC layout (the override case). Mobile layout skips this entirely.
+			local mobileLayout = S.isMobileLayout and S.isMobileLayout()
+			if UserInputService.TouchEnabled and not mobileLayout
+				and not S.autoFlewThisSession and not flying then
 				S.autoFlewThisSession = true
 				task.defer(function()
 					if U.dock.Visible and not flying then setFlying(true) end
@@ -5228,10 +5296,173 @@ function S.initializeLateBuildUI()
 	end
 	U.trimPanel:GetPropertyChangedSignal("Visible"):Connect(S.layoutRightRail)
 
+	--------------------------------------------------------------------
+	-- MOBILE BUILD LAYER (v9.6)
+	-- A presentation branch, not a fork: same tools, remotes and state as
+	-- desktop - only the layout and camera/character behaviour differ. Gated
+	-- on a per-session detection flag so PC is never affected. The server
+	-- contract is byte-identical, so a phone and a PC player share a plot
+	-- with zero desync.
+	--------------------------------------------------------------------
+	do
+		-- DETECTION: default to mobile when the device can touch, but expose a
+		-- toggle so touch-laptops / keyboarded tablets can override. The choice
+		-- lives in an attribute so it's event-driven and survives re-opening
+		-- build mode without re-asking.
+		local autoMobile = UserInputService.TouchEnabled
+		if player:GetAttribute("BuildLayoutMobile") == nil then
+			player:SetAttribute("BuildLayoutMobile", autoMobile)
+		end
+		local function isMobileLayout()
+			return player:GetAttribute("BuildLayoutMobile") == true
+		end
+		S.isMobileLayout = isMobileLayout
+
+		-- Small corner toggle to switch layouts on the fly.
+		U.layoutToggle = Instance.new("TextButton")
+		U.layoutToggle.Size = UDim2.fromOffset(112, 30)
+		U.layoutToggle.AnchorPoint = Vector2.new(1, 0)
+		U.layoutToggle.Position = UDim2.new(1, -14, 0, 62)
+		U.layoutToggle.BackgroundColor3 = C.PANEL
+		U.layoutToggle.Font = Enum.Font.GothamBold
+		U.layoutToggle.TextSize = 11
+		U.layoutToggle.TextColor3 = C.TEXT_GRAY
+		U.layoutToggle.Text = isMobileLayout() and "Layout: Mobile" or "Layout: PC"
+		U.layoutToggle.Visible = false
+		U.layoutToggle.Parent = U.gui
+		corner(U.layoutToggle, 8); stroke(U.layoutToggle)
+		U.layoutToggle.MouseButton1Click:Connect(function()
+			player:SetAttribute("BuildLayoutMobile", not isMobileLayout())
+		end)
+
+		--------------------------------------------------------------------
+		-- CHARACTER LOCK: while building on mobile, the avatar is frozen so a
+		-- finger-drag DRAWS instead of walking. This is the single biggest
+		-- mobile fix. On exit / layout-switch the character is released.
+		--------------------------------------------------------------------
+		local locked = false
+		local savedWalk, savedJump = 16, 50
+		local function setCharacterLocked(on)
+			local char = player.Character
+			local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+			local root = char and char:FindFirstChild("HumanoidRootPart")
+			if on == locked then return end
+			locked = on
+			if on then
+				if humanoid then
+					savedWalk = humanoid.WalkSpeed
+					savedJump = humanoid.JumpPower
+					humanoid.WalkSpeed = 0
+					humanoid.JumpPower = 0
+				end
+				if root then root.Anchored = true end
+			else
+				if humanoid then
+					humanoid.WalkSpeed = savedWalk
+					humanoid.JumpPower = savedJump
+				end
+				if root then root.Anchored = false end
+			end
+		end
+		S.setBuildCharacterLocked = setCharacterLocked
+
+		--------------------------------------------------------------------
+		-- BLOXBURG-STYLE ORBIT CAMERA (mobile): the camera orbits a focus
+		-- point over the plot. One-finger drag on empty space orbits; pinch
+		-- zooms; two-finger drag pans the focus. No D-pad. Reuses camYaw/
+		-- camPitch already declared in the free-cam block above.
+		--------------------------------------------------------------------
+		local orbitFocus = Vector3.zero
+		local orbitDist = 42
+		local orbitConn = nil
+
+		local function orbitStep()
+			local rot = CFrame.fromEulerAnglesYXZ(camPitch, camYaw, 0)
+			local offset = rot * Vector3.new(0, 0, orbitDist)
+			camera.CFrame = CFrame.lookAt(orbitFocus + offset, orbitFocus)
+		end
+
+		local function startOrbitCam()
+			local plot = myPlotPart()
+			if plot then
+				orbitFocus = plot.Position + Vector3.new(0, WALL_HEIGHT * 0.5, 0)
+				orbitDist = math.clamp(plot.Size.Magnitude * 0.5, 24, 90)
+			else
+				orbitFocus = camera.CFrame.Position + camera.CFrame.LookVector * 20
+			end
+			camPitch = -0.5
+			camera.CameraType = Enum.CameraType.Scriptable
+			if not orbitConn then
+				orbitConn = RunService.RenderStepped:Connect(orbitStep)
+			end
+			orbitStep()
+		end
+		local function stopOrbitCam()
+			if orbitConn then orbitConn:Disconnect() orbitConn = nil end
+			camera.CameraType = Enum.CameraType.Custom
+		end
+
+		-- Pinch to zoom + two-finger pan. TouchMoved (single finger) already
+		-- orbits via the free-cam handler; we only add multi-touch here.
+		UserInputService.TouchPinch:Connect(function(_, scale, _, state)
+			if not (isMobileLayout() and U.dock.Visible and orbitConn) then return end
+			if state == Enum.UserInputState.Change then
+				orbitDist = math.clamp(orbitDist / math.clamp(scale, 0.5, 2), 12, 140)
+			end
+		end)
+		UserInputService.TouchPan:Connect(function(_, totalTranslation, _, state)
+			if not (isMobileLayout() and U.dock.Visible and orbitConn) then return end
+			if state == Enum.UserInputState.Change then
+				-- pan the focus in the camera's ground plane
+				local rot = CFrame.fromEulerAnglesYXZ(0, camYaw, 0)
+				local right = rot.RightVector
+				local fwd = rot.LookVector
+				orbitFocus -= (right * totalTranslation.X + fwd * -totalTranslation.Y) * 0.05
+			end
+		end)
+
+		--------------------------------------------------------------------
+		-- ENGAGE / DISENGAGE the mobile layer. Driven by the same dock
+		-- visibility signal everything else uses - no polling.
+		--------------------------------------------------------------------
+		local function applyMobileState()
+			local on = isMobileLayout() and U.dock.Visible
+			U.layoutToggle.Visible = U.dock.Visible and UserInputService.TouchEnabled
+			U.layoutToggle.Text = isMobileLayout() and "Layout: Mobile" or "Layout: PC"
+			-- hide the desktop free-cam D-pad + its button on mobile (orbit
+			-- replaces it); hide the camera arrow pad entirely
+			if U.flyBtn then U.flyBtn.Visible = U.dock.Visible and not isMobileLayout() end
+			if U.flyPad then U.flyPad.Visible = false end
+			if on then
+				setCharacterLocked(true)
+				startOrbitCam()
+			else
+				stopOrbitCam()
+				setCharacterLocked(false)
+			end
+		end
+		S.applyMobileState = applyMobileState
+
+		U.dock:GetPropertyChangedSignal("Visible"):Connect(applyMobileState)
+		player:GetAttributeChangedSignal("BuildLayoutMobile"):Connect(function()
+			-- re-run layout so panel sizing switches immediately
+			applyMobileState()
+			layout()
+		end)
+		-- respawns must not leave a locked/anchored character stranded
+		player.CharacterAdded:Connect(function()
+			locked = false
+			if isMobileLayout() and U.dock.Visible then
+				task.wait(0.3)
+				setCharacterLocked(true)
+			end
+		end)
+	end
+
 	layout()
 	camera:GetPropertyChangedSignal("ViewportSize"):Connect(layout)
 end
 
 S.initializeLateBuildUI()
 S.initializeLateBuildUI = nil
-print("[BuildClient v9.5] GUI initialized - responsive mobile layout, two-sided walls")
+print("[BuildClient v9.7] GUI initialized - responsive mobile layout, two-sided walls")
