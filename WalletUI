@@ -1,0 +1,169 @@
+--[[
+    WalletUI v2 Clean (LocalScript)
+    LOCATION: StarterGui
+
+    Curved-square controls, hand-drawn sprig icon, responsive sizing, and no emoji.
+    Reads the canonical player attribute named "Wallet".
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local MarketplaceService = game:GetService("MarketplaceService")
+local TweenService = game:GetService("TweenService")
+local Players = game:GetService("Players")
+
+local player = Players.LocalPlayer
+local COLORS = {
+	panel = Color3.fromRGB(27,31,38), card = Color3.fromRGB(39,45,55),
+	edge = Color3.fromRGB(66,74,88), text = Color3.fromRGB(230,235,243),
+	muted = Color3.fromRGB(157,166,181), gold = Color3.fromRGB(235,188,72),
+	goldDark = Color3.fromRGB(174,126,34), green = Color3.fromRGB(88,196,128),
+	red = Color3.fromRGB(226,96,96), accent = Color3.fromRGB(83,153,245),
+}
+local BUNDLES = {
+	{ id = 0, amount = 500, label = "Pocketful", robux = 25 },
+	{ id = 0, amount = 1500, label = "Satchel", robux = 65 },
+	{ id = 0, amount = 4000, label = "Strongbox", robux = 150, best = true },
+	{ id = 0, amount = 10000, label = "Vault", robux = 350 },
+}
+local Currency
+pcall(function() Currency = require(ReplicatedStorage:WaitForChild("Currency", 8)) end)
+Currency = Currency or {
+	PLURAL = "Sprigs",
+	short = function(n) return tostring(math.floor(tonumber(n) or 0)) end,
+}
+
+local function corner(obj, radius)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, radius or 12)
+	c.Parent = obj
+end
+local function stroke(obj, color, thickness)
+	local s = Instance.new("UIStroke")
+	s.Color = color or COLORS.edge
+	s.Thickness = thickness or 1
+	s.Transparency = 0.15
+	s.Parent = obj
+end
+local function rect(parent, size, position, color, radius)
+	local f = Instance.new("Frame")
+	f.Size = size
+	f.Position = position
+	f.BackgroundColor3 = color
+	f.BorderSizePixel = 0
+	f.Parent = parent
+	if radius then corner(f, radius) end
+	return f
+end
+local function drawSprigCoin(parent, size)
+	local holder = rect(parent, UDim2.fromOffset(size,size), UDim2.new(), COLORS.gold, math.floor(size/2))
+	stroke(holder, COLORS.goldDark, 1.5)
+	local stem = rect(holder, UDim2.fromOffset(2, math.floor(size*.42)), UDim2.fromOffset(math.floor(size*.5)-1, math.floor(size*.31)), COLORS.goldDark, 1)
+	stem.Rotation = 0
+	local l1 = rect(holder, UDim2.fromOffset(math.floor(size*.25),5), UDim2.fromOffset(math.floor(size*.19),math.floor(size*.37)), COLORS.goldDark, 3); l1.Rotation=-28
+	local l2 = rect(holder, UDim2.fromOffset(math.floor(size*.25),5), UDim2.fromOffset(math.floor(size*.54),math.floor(size*.37)), COLORS.goldDark, 3); l2.Rotation=28
+	local l3 = rect(holder, UDim2.fromOffset(math.floor(size*.20),4), UDim2.fromOffset(math.floor(size*.25),math.floor(size*.54)), COLORS.goldDark, 3); l3.Rotation=-20
+	local l4 = rect(holder, UDim2.fromOffset(math.floor(size*.20),4), UDim2.fromOffset(math.floor(size*.56),math.floor(size*.54)), COLORS.goldDark, 3); l4.Rotation=20
+	return holder
+end
+local function drawPlus(parent)
+	rect(parent, UDim2.fromOffset(14,3), UDim2.new(.5,-7,.5,-1), Color3.fromRGB(34,29,14), 2)
+	rect(parent, UDim2.fromOffset(3,14), UDim2.new(.5,-1,.5,-7), Color3.fromRGB(34,29,14), 2)
+end
+local function animateButton(button, base)
+	button.AutoButtonColor = false
+	button.MouseEnter:Connect(function()
+		TweenService:Create(button,TweenInfo.new(.12),{BackgroundColor3=COLORS.accent}):Play()
+	end)
+	button.MouseLeave:Connect(function()
+		TweenService:Create(button,TweenInfo.new(.12),{BackgroundColor3=base}):Play()
+	end)
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "WalletUI"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 8
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local scale = Instance.new("UIScale")
+scale.Scale = 1
+scale.Parent = gui
+local function resize()
+	local viewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1280,720)
+	scale.Scale = math.clamp(viewport.X/1280, .78, 1)
+end
+resize()
+workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(resize)
+
+local plate = rect(gui, UDim2.fromOffset(178,56), UDim2.fromOffset(14,62), COLORS.panel, 14)
+stroke(plate)
+drawSprigCoin(plate,36).Position = UDim2.fromOffset(10,10)
+local amount = Instance.new("TextLabel")
+amount.Size = UDim2.fromOffset(84,26); amount.Position = UDim2.fromOffset(54,7)
+amount.BackgroundTransparency=1; amount.Font=Enum.Font.GothamBold; amount.TextSize=19
+amount.TextColor3=COLORS.text; amount.TextXAlignment=Enum.TextXAlignment.Left; amount.Text="0"; amount.Parent=plate
+local unit = Instance.new("TextLabel")
+unit.Size=UDim2.fromOffset(84,14); unit.Position=UDim2.fromOffset(54,31); unit.BackgroundTransparency=1
+unit.Font=Enum.Font.GothamBold; unit.TextSize=10; unit.TextColor3=COLORS.muted; unit.TextXAlignment=Enum.TextXAlignment.Left
+unit.Text=tostring(Currency.PLURAL or "Sprigs"):upper(); unit.Parent=plate
+local plus = Instance.new("TextButton")
+plus.Size=UDim2.fromOffset(34,34); plus.Position=UDim2.new(1,-42,0,11); plus.BackgroundColor3=COLORS.gold
+plus.Text=""; plus.Parent=plate; corner(plus,10); stroke(plus,COLORS.goldDark,1)
+drawPlus(plus)
+
+local shop = rect(gui, UDim2.fromOffset(320,336), UDim2.fromOffset(14,126), COLORS.panel, 16)
+shop.Visible=false; stroke(shop)
+local title = Instance.new("TextLabel")
+title.Size=UDim2.new(1,-60,0,42); title.Position=UDim2.fromOffset(16,4); title.BackgroundTransparency=1
+title.Font=Enum.Font.GothamBold; title.TextSize=15; title.TextColor3=COLORS.text; title.TextXAlignment=Enum.TextXAlignment.Left
+title.Text="GET "..tostring(Currency.PLURAL or "Sprigs"):upper(); title.Parent=shop
+local close = Instance.new("TextButton")
+close.Size=UDim2.fromOffset(32,32); close.Position=UDim2.new(1,-42,0,9); close.BackgroundColor3=COLORS.card
+close.Text="X"; close.Font=Enum.Font.GothamBold; close.TextSize=12; close.TextColor3=COLORS.text; close.Parent=shop
+corner(close,10); stroke(close)
+
+for i,bundle in ipairs(BUNDLES) do
+	local row = rect(shop,UDim2.fromOffset(288,58),UDim2.fromOffset(16,46+(i-1)*66),COLORS.card,12)
+	if bundle.best then stroke(row,COLORS.gold,1.5) end
+	drawSprigCoin(row,28).Position=UDim2.fromOffset(12,15)
+	local a=Instance.new("TextLabel"); a.Size=UDim2.fromOffset(110,20); a.Position=UDim2.fromOffset(50,9); a.BackgroundTransparency=1
+	a.Font=Enum.Font.GothamBold; a.TextSize=15; a.TextColor3=COLORS.text; a.TextXAlignment=Enum.TextXAlignment.Left
+	a.Text=Currency.short(bundle.amount); a.Parent=row
+	local sub=Instance.new("TextLabel"); sub.Size=UDim2.fromOffset(120,16); sub.Position=UDim2.fromOffset(50,31); sub.BackgroundTransparency=1
+	sub.Font=Enum.Font.Gotham; sub.TextSize=10; sub.TextColor3=bundle.best and COLORS.gold or COLORS.muted
+	sub.TextXAlignment=Enum.TextXAlignment.Left; sub.Text=bundle.best and (bundle.label.."  BEST") or bundle.label; sub.Parent=row
+	local buy=Instance.new("TextButton"); buy.Size=UDim2.fromOffset(88,34); buy.Position=UDim2.new(1,-100,0,12)
+	buy.BackgroundColor3=(bundle.id>0) and COLORS.gold or Color3.fromRGB(54,61,73); buy.Font=Enum.Font.GothamBold
+	buy.TextSize=12; buy.TextColor3=(bundle.id>0) and Color3.fromRGB(34,29,14) or COLORS.muted
+	buy.Text=(bundle.id>0) and ("R$ "..bundle.robux) or "COMING SOON"; buy.Parent=row; corner(buy,10)
+	buy.MouseButton1Click:Connect(function()
+		if bundle.id<=0 then
+			sub.Text="Add product ID first"
+			task.delay(2,function() if sub.Parent then sub.Text=bundle.best and (bundle.label.."  BEST") or bundle.label end end)
+		else
+			MarketplaceService:PromptProductPurchase(player,bundle.id)
+		end
+	end)
+end
+
+plus.MouseButton1Click:Connect(function() shop.Visible=not shop.Visible end)
+close.MouseButton1Click:Connect(function() shop.Visible=false end)
+
+local last
+local function popup(delta)
+	local t=Instance.new("TextLabel"); t.Size=UDim2.fromOffset(130,24); t.Position=UDim2.fromOffset(66,116)
+	t.BackgroundTransparency=1; t.Font=Enum.Font.GothamBold; t.TextSize=15; t.TextXAlignment=Enum.TextXAlignment.Left
+	t.TextColor3=(delta>0) and COLORS.green or COLORS.red; t.Text=(delta>0 and "+" or "")..Currency.short(delta); t.Parent=gui
+	TweenService:Create(t,TweenInfo.new(1),{Position=UDim2.fromOffset(66,92),TextTransparency=1}):Play()
+	task.delay(1.05,function() t:Destroy() end)
+end
+local function refresh()
+	local value=player:GetAttribute("Wallet")
+	if type(value)~="number" then return end
+	amount.Text=Currency.short(value)
+	if last and value~=last then popup(value-last) end
+	last=value
+end
+player:GetAttributeChangedSignal("Wallet"):Connect(refresh)
+refresh()
+print("[WalletUI v2] clean wallet ready")
