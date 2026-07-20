@@ -1,0 +1,5237 @@
+--[[
+	BuildClient v9 Pastel + Performance (LocalScript)
+	LOCATION: StarterGui - paste over the previous version
+
+	New in v9:
+	  - FIX: bare D no longer copies (it is the strafe key!). Walking right
+	    with a wall/floor selected was silently cloning it in place - that
+	    was the "duplicates every 3-5 seconds" bug. Copy is now Ctrl+D.
+	  - FIX: GUI hiding is tag-based. Startup recovery only re-enables
+	    interfaces THIS script hid, so other systems' intentionally
+	    disabled GUIs (second inventory panel!) stay asleep.
+	  - Kid-friendly pastel light theme matching the plot picker.
+	  - Zero idle polling: the canbuild server poll is now a client-side
+	    check scheduled only while the dock is open; the watchdog loop is
+	    gone; free-cam's render loop exists only while flying; the time
+	    preview is driven by a ClockTime listener instead of a loop.
+	  - Hover raycasts are skipped entirely on touch devices.
+	  - Quick-action tinting only writes when the state actually changes.
+
+	Kept from v8.x: kid-friendly Select controls, story indices, Stack Up,
+	Floor Focus / Hide Roofs cutaway, window sill controls, roof grid/
+	overhang/rotation, wall corner auto-snap, server-validated permissions.
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+
+local C, U, S = {}, {}, {} -- colours, UI, build state -- colour + UI tables (keeps this script
+-- under Luau's 200-local limit for a single scope)
+local player = Players.LocalPlayer
+local mouse = player:GetMouse()
+local camera = workspace.CurrentCamera
+
+-- Prefer the server-marked canonical instances. Old PlotServer copies can
+-- leave duplicate remotes/folders with identical names; WaitForChild alone may
+-- bind this client to the wrong one, breaking the GUI, shop and structure select.
+S.findCanonical = function(parent, name, className)
+	local fallback = nil
+	for _ = 1, 100 do
+		for _, child in ipairs(parent:GetChildren()) do
+			if child.Name == name and child.ClassName == className then
+				fallback = fallback or child
+				if child:GetAttribute("BuildSystemCanonical") == true then
+					return child
+				end
+			end
+		end
+		task.wait(0.05)
+	end
+	return fallback or parent:WaitForChild(name, 10)
+end
+
+local buildRemote = S.findCanonical(ReplicatedStorage, "PlotBuild", "RemoteFunction")
+local invRemote = S.findCanonical(ReplicatedStorage, "PlotInv", "RemoteEvent")
+local furnitureFolder = ReplicatedStorage:WaitForChild("Furniture", 10)
+local itemsRoot = S.findCanonical(workspace, "PlacedItems", "Folder")
+if not (buildRemote and invRemote and itemsRoot) then
+	error("[BuildClient v9.5] Missing canonical PlotBuild, PlotInv, or PlacedItems")
+end
+print("[BuildClient v9.5] bound to " .. buildRemote:GetFullName()
+	.. " and " .. itemsRoot:GetFullName())
+local RoofShapes = nil
+pcall(function()
+	RoofShapes = require(ReplicatedStorage:WaitForChild("RoofShapes", 10))
+end)
+local Currency = nil
+pcall(function()
+	Currency = require(ReplicatedStorage:WaitForChild("Currency", 10))
+end)
+-- Optional wall-snap module. FindFirstChild is intentional: a missing module
+-- must never stop the entire build GUI from compiling or opening.
+pcall(function()
+	local module = ReplicatedStorage:FindFirstChild("BuildWallSnapClient")
+	if module then S.WallSnap = require(module) end
+end)
+S.wallSnapEnabled = S.WallSnap ~= nil
+S.wallSnapRadius = 1.35
+S.wallSnapMarker = nil
+local function money(n)
+	if Currency then return Currency.display(n) end
+	return tostring(n) .. " tokens"
+end
+
+local GRID, WGRID = 1, 1
+
+-- Adjustable snap increments (Studio-style), cycled from the select bar
+U.MOVE_SNAPS = { 0.25, 0.5, 1, 2, 4 }
+U.ROT_SNAPS = { 15, 45, 90 }
+U.SCALE_STEPS = { 0.05, 0.1, 0.25 }
+local moveSnapIdx, rotSnapIdx, scaleStepIdx = 3, 2, 2
+local function moveSnap() return U.MOVE_SNAPS[moveSnapIdx] end
+local function rotSnap() return U.ROT_SNAPS[rotSnapIdx] end
+local function scaleStep() return U.SCALE_STEPS[scaleStepIdx] end
+local WALL_HEIGHT = 8
+local MAX_LEVEL = 2       -- displayed as story 3
+local MIN_LEVEL = -1      -- basement
+local ROOF_FLOOR_GAP = 0.08
+-- v9 PASTEL THEME: every panel/button reads these, so the whole interface
+-- restyles from this one block (soft white cards, friendly sky-blue accent).
+C.WHITE = Color3.fromRGB(255,255,255)      -- pure white, for text on accents
+C.PANEL = Color3.fromRGB(252, 253, 255)    -- soft white panels
+C.PANEL_EDGE = Color3.fromRGB(221, 227, 236) -- gentle border
+C.TEXT_GRAY = Color3.fromRGB(72, 80, 94)   -- dark friendly text on light
+C.ACCENT = Color3.fromRGB(88, 170, 255)    -- sky blue
+C.RED = Color3.fromRGB(238, 118, 128)      -- soft coral
+C.GREEN = Color3.fromRGB(112, 200, 138)    -- soft green
+C.GOLD = Color3.fromRGB(236, 180, 84)      -- soft gold
+C.CARD_BG = Color3.fromRGB(237, 242, 249)  -- pastel cards/buttons
+
+U.MATERIALS = {
+	"SmoothPlastic", "Brick", "Wood", "WoodPlanks", "Concrete",
+	"Marble", "Granite", "Slate", "Fabric", "Metal",
+	"Cobblestone", "Pebble", "Sandstone", "Limestone", "Pavement",
+	"Asphalt", "Ice", "Glass",
+}
+U.PAINT_COLORS = {
+	-- neutrals
+	Color3.fromRGB(255,255,255), Color3.fromRGB(235,235,230), Color3.fromRGB(200,200,200),
+	Color3.fromRGB(150,150,155), Color3.fromRGB(90,90,95),    Color3.fromRGB(40,40,45),
+	-- warm woods & earth
+	Color3.fromRGB(230,205,170), Color3.fromRGB(196,168,130), Color3.fromRGB(160,120,85),
+	Color3.fromRGB(120,70,60),   Color3.fromRGB(90,60,45),    Color3.fromRGB(60,40,30),
+	-- reds/oranges/yellows
+	Color3.fromRGB(220,80,80),   Color3.fromRGB(235,130,80),  Color3.fromRGB(240,180,40),
+	Color3.fromRGB(250,225,120), Color3.fromRGB(255,192,203), Color3.fromRGB(190,60,90),
+	-- greens/blues/purples
+	Color3.fromRGB(70,190,110),  Color3.fromRGB(120,180,120), Color3.fromRGB(0,170,255),
+	Color3.fromRGB(70,110,180),  Color3.fromRGB(140,110,200), Color3.fromRGB(205,180,219),
+}
+
+local function corner(p, r) local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, r or 12); c.Parent = p end
+local function stroke(p) local s = Instance.new("UIStroke"); s.Color = C.PANEL_EDGE; s.Thickness = 1; s.Transparency = 0.15; s.Parent = p end
+
+local function ensurePrimaryPart(model)
+	if model.PrimaryPart then return true end
+	local biggest, size = nil, 0
+	for _, part in ipairs(model:GetDescendants()) do
+		if part:IsA("BasePart") then
+			local s = part.Size.X * part.Size.Y * part.Size.Z
+			if s > size then biggest, size = part, s end
+		end
+	end
+	model.PrimaryPart = biggest
+	return biggest ~= nil
+end
+
+--------------------------------------------------------------------
+-- CATALOG DATA
+--------------------------------------------------------------------
+local categories = {}
+if furnitureFolder then
+	local misc = {}
+	for _, child in ipairs(furnitureFolder:GetChildren()) do
+		if child:IsA("Folder") then
+			local items = {}
+			for _, m in ipairs(child:GetChildren()) do
+				if m:IsA("Model") then table.insert(items, m) end
+			end
+			if #items > 0 then table.insert(categories, { name = child.Name, items = items }) end
+		elseif child:IsA("Model") then
+			table.insert(misc, child)
+		end
+	end
+	table.sort(categories, function(a, b) return a.name < b.name end)
+	if #misc > 0 then table.insert(categories, { name = "Misc", items = misc }) end
+end
+
+local function findTemplate(itemName)
+	if not furnitureFolder then return nil end
+	local direct = furnitureFolder:FindFirstChild(itemName)
+	if direct and direct:IsA("Model") then return direct end
+	return furnitureFolder:FindFirstChild(itemName, true)
+end
+
+local inventory = {}
+U.STRUCT_NAMES = { __Wall = true, __Floor = true, __Roof = true }
+S.isStructure = function(model)
+	return model ~= nil and (U.STRUCT_NAMES[model.Name] == true
+		or model:GetAttribute("StructureKind") ~= nil)
+end
+
+--------------------------------------------------------------------
+-- GUI SHELL
+--------------------------------------------------------------------
+-- Remove a stranded copy from a previous/duplicate BuildClient. Keep exactly
+-- one BuildClient LocalScript installed; this cleanup prevents a stale GUI
+-- from covering the live one during migration.
+do
+	local pg = player:WaitForChild("PlayerGui")
+	for _, child in ipairs(pg:GetChildren()) do
+		if child:IsA("ScreenGui") and child.Name == "BuildUI" then
+			child:Destroy()
+		end
+	end
+end
+U.gui = Instance.new("ScreenGui")
+U.gui.Name = "BuildUI"
+U.gui.ResetOnSpawn = false
+U.gui.Parent = player:WaitForChild("PlayerGui")
+
+U.toggle = Instance.new("TextButton")
+U.toggle.Size = UDim2.fromOffset(52, 52)
+U.toggle.Position = UDim2.new(0, 12, 1, -130)
+U.toggle.BackgroundColor3 = C.PANEL
+U.toggle.Text = ""
+U.toggle.AutoButtonColor = false
+U.toggle.Parent = U.gui
+corner(U.toggle, 14); stroke(U.toggle)
+
+U.dock = Instance.new("Frame")
+U.dock.Size = UDim2.new(0, 950, 0, 330) -- resized at runtime by layout()
+U.dock.AnchorPoint = Vector2.new(0.5, 1)
+U.dock.Position = UDim2.new(0.5, 0, 1, -14)
+U.dock.BackgroundColor3 = C.PANEL
+U.dock.BackgroundTransparency = 0.04
+U.dock.Visible = false
+U.dock.Parent = U.gui
+corner(U.dock, 16); stroke(U.dock)
+
+U.header = Instance.new("TextLabel")
+U.header.Size = UDim2.new(1, -110, 0, 22)
+U.header.Position = UDim2.fromOffset(14, 4)
+U.header.BackgroundTransparency = 1
+U.header.Font = Enum.Font.GothamBold
+U.header.TextSize = 12
+U.header.TextColor3 = C.TEXT_GRAY
+U.header.TextXAlignment = Enum.TextXAlignment.Left
+U.header.Text = "BUILD MODE"
+U.header.Parent = U.dock
+
+-- clear way out of build mode (the 🔨 button toggles, this one just exits)
+U.exitBtn = Instance.new("TextButton")
+U.exitBtn.Size = UDim2.fromOffset(84, 24)
+U.exitBtn.AnchorPoint = Vector2.new(1, 0)
+U.exitBtn.Position = UDim2.new(1, -10, 0, 3)
+U.exitBtn.BackgroundColor3 = C.RED
+U.exitBtn.Font = Enum.Font.GothamBold
+U.exitBtn.TextSize = 12
+U.exitBtn.TextColor3 = C.WHITE
+U.exitBtn.Text = "EXIT BUILD"
+U.exitBtn.Parent = U.dock
+corner(U.exitBtn, 8)
+
+local mode -- current tool; declared here because flash() reads it
+S.stampMode, S.stampHeld, S.stampBusy = false, false, false
+S.toggleStamp = function() end
+local function flash(msg)
+	U.header.Text = msg
+	task.delay(2, function()
+		if mode == "wall" or mode == "floor" or mode == "roof" then return end
+		U.header.Text = "BUILD MODE"
+	end)
+end
+
+-- Tool buttons row
+--------------------------------------------------------------------
+-- ICONS: drawn from simple shapes instead of emoji, so the toolbar looks
+-- consistent on every device rather than depending on font support.
+--------------------------------------------------------------------
+local function px(parent, w, h, x, y, colour, rot, radius)
+	local f = Instance.new("Frame")
+	f.Size = UDim2.fromOffset(w, h)
+	f.Position = UDim2.fromOffset(x, y)
+	f.BackgroundColor3 = colour
+	f.BorderSizePixel = 0
+	f.Rotation = rot or 0
+	f.Parent = parent
+	if radius then
+		local uc = Instance.new("UICorner")
+		uc.CornerRadius = UDim.new(0, radius)
+		uc.Parent = f
+	end
+	return f
+end
+
+local function drawIcon(parent, kind, tint)
+	local holder = Instance.new("Frame")
+	holder.Size = UDim2.fromOffset(24, 24)
+	holder.BackgroundTransparency = 1
+	holder.Name = "Icon"
+	holder.Parent = parent
+	local col = tint or C.TEXT_GRAY
+	local dark = C.CARD_BG -- cut-outs match the light card behind the icon
+
+	if kind == "build" then                     -- compact hammer
+		px(holder, 14, 4, 3, 5, col, -35, 2)
+		px(holder, 4, 15, 12, 8, col, -35, 2)
+		px(holder, 8, 3, 1, 8, col, -35, 1)
+	elseif kind == "move" then                        -- four-way arrows
+		px(holder, 3, 20, 11, 2, col, 0, 2)
+		px(holder, 20, 3, 2, 11, col, 0, 2)
+		px(holder, 7, 3, 8, 4, col, 45, 1)
+		px(holder, 7, 3, 9, 4, col, -45, 1)
+	elseif kind == "wall" then                    -- brick courses
+		px(holder, 20, 5, 2, 3, col, 0, 1)
+		px(holder, 20, 5, 2, 10, col, 0, 1)
+		px(holder, 20, 5, 2, 17, col, 0, 1)
+	elseif kind == "floor" then                   -- receding plane
+		px(holder, 20, 4, 2, 14, col, 0, 1)
+		px(holder, 14, 3, 5, 9, col, 0, 1)
+		px(holder, 8, 2, 8, 5, col, 0, 1)
+	elseif kind == "roof" then                    -- two meeting slopes
+		px(holder, 16, 3, 0, 12, col, -32, 1)
+		px(holder, 16, 3, 8, 12, col, 32, 1)
+	elseif kind == "paint" then                   -- brush
+		px(holder, 12, 11, 6, 2, col, 0, 5)
+		px(holder, 4, 9, 10, 13, col, 0, 2)
+	elseif kind == "delete" then                  -- bin
+		px(holder, 16, 3, 4, 5, col, 0, 1)
+		px(holder, 6, 2, 9, 2, col, 0, 1)
+		px(holder, 13, 14, 5, 9, col, 0, 2)
+	elseif kind == "save" then                    -- disk
+		px(holder, 18, 18, 3, 3, col, 0, 3)
+		px(holder, 9, 5, 8, 4, dark, 0, 1)
+		px(holder, 12, 7, 6, 13, dark, 0, 1)
+	elseif kind == "bulldoze" then                -- burst
+		px(holder, 18, 3, 3, 11, col, 0, 1)
+		px(holder, 18, 3, 3, 11, col, 60, 1)
+		px(holder, 18, 3, 3, 11, col, -60, 1)
+	elseif kind == "undo" then                    -- back arrow
+		px(holder, 15, 3, 5, 10, col, 0, 1)
+		px(holder, 8, 3, 3, 7, col, 45, 1)
+		px(holder, 8, 3, 3, 13, col, -45, 1)
+	elseif kind == "trim" then                    -- wall with edge mouldings
+		px(holder, 18, 12, 3, 6, col, 0, 1)
+		px(holder, 22, 3, 1, 3, col, 0, 1)
+		px(holder, 22, 3, 1, 18, col, 0, 1)
+	elseif kind == "sell" then                    -- coin heading out
+		px(holder, 14, 14, 2, 8, col, 0, 7)
+		px(holder, 10, 3, 12, 5, col, -35, 1)
+		px(holder, 5, 3, 18, 2, col, 40, 1)
+		px(holder, 5, 3, 18, 6, col, -40, 1)
+	elseif kind == "shop" then                    -- shopping bag
+		px(holder, 16, 13, 4, 8, col, 0, 2)
+		px(holder, 3, 6, 7, 3, col, 0, 1)
+		px(holder, 3, 6, 14, 3, col, 0, 1)
+		px(holder, 8, 2, 8, 3, col, 0, 1)
+	elseif kind == "copy" then                    -- two sheets
+		px(holder, 11, 13, 3, 2, col, 0, 2)
+		px(holder, 11, 13, 10, 9, col, 0, 2)
+	end
+	return holder
+end
+
+-- The build launcher uses the same hand-drawn icon language as the dock.
+S.buildToggleIcon = drawIcon(U.toggle, "build", C.GOLD)
+S.buildToggleIcon.AnchorPoint = Vector2.new(0.5, 0.5)
+S.buildToggleIcon.Position = UDim2.fromScale(0.5, 0.5)
+
+U.toolDefs = {
+	{ id = "select", icon = "move",   label = "Select" },
+	{ id = "wall",   icon = "wall",   label = "Wall" },
+	{ id = "floor",  icon = "floor",  label = "Floor" },
+	{ id = "roof",   icon = "roof",   label = "Roof" },
+	{ id = "paint",  icon = "paint",  label = "Paint" },
+	{ id = "trim",   icon = "trim",   label = "Trim" },
+	{ id = "sell",   icon = "sell",   label = "Sell", color = C.GOLD },
+}
+U.toolButtons, U.toolIcons, U.toolLabels = {}, {}, {}
+for i, def in ipairs(U.toolDefs) do
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(84, 52)
+	b.Position = UDim2.fromOffset(10 + (i - 1) * 90, 28)
+	b.BackgroundColor3 = C.CARD_BG
+	b.Text = ""
+	b.Parent = U.dock
+	corner(b, 12); stroke(b)
+	U.toolButtons[def.id] = b
+
+	local icon = drawIcon(b, def.icon, def.color or C.TEXT_GRAY)
+	icon.AnchorPoint = Vector2.new(0.5, 0)
+	icon.Position = UDim2.new(0.5, 0, 0, 5)
+	U.toolIcons[def.id] = icon
+
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.new(1, 0, 0, 16)
+	label.Position = UDim2.fromOffset(0, 31)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.FredokaOne
+	label.TextSize = 12
+	label.TextColor3 = def.color or C.TEXT_GRAY
+	label.Text = def.label
+	label.Parent = b
+	U.toolLabels[def.id] = label
+end
+
+-- ALWAYS-VISIBLE quick actions (right side of the tool row)
+local function actionBtn(iconKind, label, x, color)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(78, 52)
+	b.Position = UDim2.new(1, x, 0, 28)
+	b.BackgroundColor3 = C.CARD_BG
+	b.Text = ""
+	b.Parent = U.dock
+	corner(b, 12); stroke(b)
+
+	local ic = drawIcon(b, iconKind, color or C.TEXT_GRAY)
+	ic.AnchorPoint = Vector2.new(0.5, 0)
+	ic.Position = UDim2.new(0.5, 0, 0, 5)
+
+	local lb = Instance.new("TextLabel")
+	lb.Size = UDim2.new(1, 0, 0, 16)
+	lb.Position = UDim2.fromOffset(0, 31)
+	lb.BackgroundTransparency = 1
+	lb.Font = Enum.Font.FredokaOne
+	lb.TextSize = 12
+	lb.TextColor3 = color or C.TEXT_GRAY
+	lb.Text = label
+	lb.Parent = b
+	return b, lb
+end
+
+U.shopAction = actionBtn("shop", "Shop", -510, C.GOLD)
+-- Autosave is always on, so the manual Save button is kept only as a hidden
+-- compatibility object. The visible bar stays simple: Shop / Clear / Undo / Copy / Remove.
+U.saveAction = actionBtn("save", "Save", -999, C.GREEN)
+U.saveAction.Visible = false
+U.bulldozeAction = actionBtn("bulldoze", "Clear", -426, C.RED)
+U.undoAction, U.undoActionLabel = actionBtn("undo", "Undo", -342, C.ACCENT)
+U.copyAction, U.copyActionLabel = actionBtn("copy", "Copy", -258, C.ACCENT)
+U.delAction, U.delActionLabel = actionBtn("delete", "Remove", -174, C.RED)
+
+-- Level selector (right edge, vertical)
+U.levelFrame = Instance.new("Frame")
+U.levelFrame.Size = UDim2.fromOffset(44, 130)
+U.levelFrame.AnchorPoint = Vector2.new(1, 1)
+U.levelFrame.Position = UDim2.new(1, -14, 1, -262)
+U.levelFrame.BackgroundColor3 = C.PANEL
+U.levelFrame.Parent = U.gui
+U.levelFrame.Visible = false
+corner(U.levelFrame, 12); stroke(U.levelFrame)
+
+local currentLevel = 0
+local refreshGridPlane = function() end -- real version assigned later
+local refreshLevelView = function() end -- local cutaway/hide-roof view
+local lockBuildPlane = function() end   -- ditto (the level buttons call it)
+local releaseBuildPlane = function() end
+U.levelButtons = {}
+-- Internal levels are zero-based: G=0, second story=1, third story=2.
+-- v7 accidentally used 2 for the second story, creating the extra-height gap.
+U.LEVELS = { {2,"3"}, {1,"2"}, {0,"G"}, {-1,"B"} }
+for i, def in ipairs(U.LEVELS) do
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(34, 26)
+	b.Position = UDim2.fromOffset(5, 5 + (i-1) * 30)
+	b.BackgroundColor3 = C.CARD_BG
+	b.Font = Enum.Font.FredokaOne
+	b.TextSize = 13
+	b.TextColor3 = C.TEXT_GRAY
+	b.Text = def[2]
+	b.Parent = U.levelFrame
+	corner(b, 8)
+	U.levelButtons[def[1]] = b
+	b.MouseButton1Click:Connect(function()
+		currentLevel = def[1]
+		for lvl, btn in pairs(U.levelButtons) do
+			btn.BackgroundColor3 = (lvl == currentLevel) and C.ACCENT or C.CARD_BG
+			btn.TextColor3 = (lvl == currentLevel) and C.WHITE or C.TEXT_GRAY
+		end
+		lockBuildPlane()
+		refreshGridPlane()
+		refreshLevelView()
+	end)
+end
+U.levelButtons[0].BackgroundColor3 = C.ACCENT
+U.levelButtons[0].TextColor3 = C.WHITE
+
+-- Bloxburg-like local cutaway controls. LocalTransparencyModifier means
+-- these buttons never change what other players see or what the server saves.
+S.focusLevelView = true
+S.hideRoofs = false
+U.viewFrame = Instance.new("Frame")
+U.viewFrame.Size = UDim2.fromOffset(154, 86)
+U.viewFrame.AnchorPoint = Vector2.new(1, 1)
+U.viewFrame.Position = UDim2.new(1, -64, 1, -402)
+U.viewFrame.BackgroundColor3 = C.PANEL
+U.viewFrame.Visible = false
+U.viewFrame.Parent = U.gui
+corner(U.viewFrame, 12); stroke(U.viewFrame)
+
+local function viewButton(text, y)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(142, 34)
+	b.Position = UDim2.fromOffset(6, y)
+	b.BackgroundColor3 = C.CARD_BG
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 11
+	b.TextColor3 = C.TEXT_GRAY
+	b.Text = text
+	b.Parent = U.viewFrame
+	corner(b, 8)
+	return b
+end
+U.focusViewBtn = viewButton("Floor Focus: ON", 6)
+U.hideRoofsBtn = viewButton("Roofs: SHOW", 46)
+U.focusViewBtn.MouseButton1Click:Connect(function()
+	S.focusLevelView = not S.focusLevelView
+	refreshLevelView()
+end)
+U.hideRoofsBtn.MouseButton1Click:Connect(function()
+	S.hideRoofs = not S.hideRoofs
+	refreshLevelView()
+end)
+
+--------------------------------------------------------------------
+-- ROOF STYLES: every entry renders a REAL 3D preview of its shape,
+-- built from the same module the server uses.
+--------------------------------------------------------------------
+local roofShape, roofPitch = "flat", 1
+-- the live roof preview lives here (declared before the style buttons,
+-- which reset it whenever the shape or pitch changes)
+S.roofGhost, S.roofGhostSig = nil, nil
+local buildTracedRoof                      -- assigned with the trace tools
+S.buildTracedRoofRef = function() if buildTracedRoof then buildTracedRoof() end end
+S.buildAutoRoofRef = function() end
+S.roofMode = "rect"                    -- "rect", "auto", or "trace"
+S.roofOverhang = 1
+S.roofSnap = 1
+S.roofRotation = 0
+S.roofMarkers = {}
+S.wallMode = "line"                    -- "line" or "box"
+S.structDragging = false
+-- shop plumbing (assigned when the shop UI is built further down)
+local renderShopRef, buildShopSidebarRef, openShopRef = function() end, function() end, function() end
+local closeBuildModeRef = function() end
+local pillSwatchRef = nil -- set once the paint pill exists
+local setWalletVisible = function() end
+local makeThumbnail          -- defined with the catalog code
+local makeThumbnailRef = function(...) if makeThumbnail then makeThumbnail(...) end end
+S.clearTraceRef = function() end
+S.harvestCornersRef = function() end
+
+local ROOF_STYLES = (RoofShapes and RoofShapes.Styles) or {
+	{ id = "flat", label = "Flat", hint = "Slab roof" },
+}
+
+-- Assemble a roof as a Model (transparent when used as a ghost)
+local function buildRoofModel(shape, sx, sz, rise, isGhost)
+	if not RoofShapes then return nil end
+	local model = Instance.new("Model")
+	model.Name = "RoofPreview"
+	local pieces = RoofShapes.Build(shape, Vector3.new(0, 0, 0), sx, sz, rise)
+	for _, piece in ipairs(pieces) do
+		local p = Instance.new(piece.wedge and "WedgePart" or "Part")
+		p.Size = piece.size
+		p.CFrame = piece.cf
+		p.Anchored = true
+		p.CanCollide = false
+		p.CanQuery = false
+		p.Material = isGhost and Enum.Material.ForceField or Enum.Material.SmoothPlastic
+		p.Color = isGhost and Color3.fromRGB(55, 174, 255) or Color3.fromRGB(226, 228, 233)
+		p.Transparency = isGhost and 0.62 or 0
+		p.Parent = model
+	end
+	if #model:GetChildren() == 0 then model:Destroy() return nil end
+	model.PrimaryPart = model:FindFirstChildWhichIsA("BasePart")
+	if isGhost then
+		local outline = Instance.new("Highlight")
+		outline.Name = "RoofPreviewOutline"
+		outline.Adornee = model
+		outline.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		outline.FillTransparency = 1
+		outline.OutlineTransparency = 0.08
+		outline.OutlineColor = Color3.fromRGB(220, 245, 255)
+		outline.Parent = model
+	end
+	return model
+end
+local ROOF_PITCHES = {
+	{ id = 0.6, label = "Low" },
+	{ id = 1.0, label = "Med" },
+	{ id = 1.6, label = "Steep" },
+}
+
+U.shapeBtn = Instance.new("Frame") -- roof panel (same name so layout() finds it)
+U.shapeBtn.Size = UDim2.fromOffset(152, 356)
+U.shapeBtn.AnchorPoint = Vector2.new(1, 1)
+U.shapeBtn.Position = UDim2.new(1, -64, 1, -262)
+U.shapeBtn.BackgroundColor3 = C.PANEL
+U.shapeBtn.BackgroundTransparency = 0.05
+U.shapeBtn.Visible = false
+U.shapeBtn.Parent = U.gui
+corner(U.shapeBtn, 12); stroke(U.shapeBtn)
+
+local roofTitle = Instance.new("TextLabel")
+roofTitle.Size = UDim2.new(1, 0, 0, 24)
+roofTitle.BackgroundTransparency = 1
+roofTitle.Font = Enum.Font.GothamBold
+roofTitle.TextSize = 12
+roofTitle.TextColor3 = C.TEXT_GRAY
+roofTitle.Text = "ROOF STYLE"
+roofTitle.Parent = U.shapeBtn
+
+local roofHint = Instance.new("TextLabel")
+roofHint.Size = UDim2.new(1, -12, 0, 30)
+roofHint.Position = UDim2.fromOffset(6, 320)
+roofHint.BackgroundTransparency = 1
+roofHint.Font = Enum.Font.Gotham
+roofHint.TextSize = 10
+roofHint.TextWrapped = true
+roofHint.TextColor3 = Color3.fromRGB(140, 148, 162)
+roofHint.Text = "Slab roof / balcony floor"
+roofHint.Parent = U.shapeBtn
+
+-- bar shown while tracing an outline
+U.traceBar = Instance.new("Frame")
+U.traceBar.Size = UDim2.fromOffset(280, 44)
+U.traceBar.AnchorPoint = Vector2.new(0.5, 1)
+U.traceBar.Position = UDim2.new(0.5, 0, 1, -320)
+U.traceBar.BackgroundColor3 = C.PANEL
+U.traceBar.Visible = false
+U.traceBar.Parent = U.gui
+corner(U.traceBar, 12); stroke(U.traceBar)
+
+U.traceCount = Instance.new("TextLabel")
+U.traceCount.Size = UDim2.fromOffset(84, 44)
+U.traceCount.Position = UDim2.fromOffset(10, 0)
+U.traceCount.BackgroundTransparency = 1
+U.traceCount.Font = Enum.Font.GothamBold
+U.traceCount.TextSize = 13
+U.traceCount.TextColor3 = C.TEXT_GRAY
+U.traceCount.TextXAlignment = Enum.TextXAlignment.Left
+U.traceCount.Text = "0 points"
+U.traceCount.Parent = U.traceBar
+
+local function traceBtn(text, x, w, colour)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(w, 32)
+	b.Position = UDim2.fromOffset(x, 6)
+	b.BackgroundColor3 = colour or C.CARD_BG
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 12
+	b.TextColor3 = (colour == C.CARD_BG or not colour) and C.TEXT_GRAY or C.WHITE
+	b.Text = text
+	b.Parent = U.traceBar
+	corner(b, 8)
+	return b
+end
+U.traceBuild = traceBtn("Build Roof", 96, 92, C.ACCENT)
+U.traceUndo = traceBtn("Undo pt", 194, 68)
+U.traceCancel = traceBtn("✕", 268, 1) -- repositioned below
+U.traceCancel.Size = UDim2.fromOffset(0, 0)
+
+local roofButtons = {}
+local function refreshRoofUI()
+	for id, b in pairs(roofButtons) do
+		local on = (id == roofShape)
+		b.BackgroundColor3 = on and C.ACCENT or C.CARD_BG
+		local lb = b:FindFirstChild("Label")
+		if lb then lb.TextColor3 = on and C.WHITE or C.TEXT_GRAY end
+	end
+	for _, def in ipairs(ROOF_STYLES) do
+		if def.id == roofShape then roofHint.Text = def.hint end
+	end
+end
+
+for i, def in ipairs(ROOF_STYLES) do
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(140, 32)
+	b.Position = UDim2.fromOffset(6, 26 + (i - 1) * 36)
+	b.BackgroundColor3 = C.CARD_BG
+	b.Text = ""
+	b.Parent = U.shapeBtn
+	corner(b, 8)
+
+	-- live 3D thumbnail of this roof style
+	local vp = Instance.new("ViewportFrame")
+	vp.Size = UDim2.fromOffset(38, 30)
+	vp.Position = UDim2.fromOffset(3, 1)
+	vp.BackgroundColor3 = Color3.fromRGB(228, 236, 246)
+	vp.Parent = b
+	corner(vp, 6)
+
+	local sample = buildRoofModel(def.id, 10, 7, 3.2, false)
+	if sample then
+		sample.Parent = vp
+		local vcam = Instance.new("Camera")
+		vcam.Parent = vp
+		vp.CurrentCamera = vcam
+		local bcf, bsize = sample:GetBoundingBox()
+		local dist = bsize.Magnitude * 0.95 + 2
+		vcam.CFrame = CFrame.lookAt(
+			bcf.Position + Vector3.new(dist * 0.55, dist * 0.45, dist * 0.55),
+			bcf.Position)
+	end
+
+	local lb = Instance.new("TextLabel")
+	lb.Name = "Label"
+	lb.Size = UDim2.new(1, -46, 1, 0)
+	lb.Position = UDim2.fromOffset(46, 0)
+	lb.BackgroundTransparency = 1
+	lb.Font = Enum.Font.GothamBold
+	lb.TextSize = 12
+	lb.TextXAlignment = Enum.TextXAlignment.Left
+	lb.TextColor3 = C.TEXT_GRAY
+	lb.Text = def.label
+	lb.Parent = b
+
+	roofButtons[def.id] = b
+	b.MouseButton1Click:Connect(function()
+		roofShape = def.id
+		S.roofGhostSig = nil -- force the preview to rebuild
+		refreshRoofUI()
+	end)
+end
+
+-- how the roof is drawn: drag a rectangle, or trace points
+local methodTitle = Instance.new("TextLabel")
+methodTitle.Size = UDim2.new(1, 0, 0, 16)
+methodTitle.Position = UDim2.fromOffset(0, 268)
+methodTitle.BackgroundTransparency = 1
+methodTitle.Font = Enum.Font.GothamBold
+methodTitle.TextSize = 11
+methodTitle.TextColor3 = C.TEXT_GRAY
+methodTitle.Text = "DRAW BY"
+methodTitle.Parent = U.shapeBtn
+
+local methodButtons = {}
+local function refreshMethod()
+	for id, b in pairs(methodButtons) do
+		local on = (id == S.roofMode)
+		b.BackgroundColor3 = on and C.ACCENT or C.CARD_BG
+		b.TextColor3 = on and C.WHITE or C.TEXT_GRAY
+	end
+end
+for i, def in ipairs({
+	{ id = "rect", label = "Drag" },
+	{ id = "auto", label = "Auto" },
+	{ id = "trace", label = "Points" },
+	}) do
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(44, 24)
+	b.Position = UDim2.fromOffset(6 + (i - 1) * 47, 286)
+	b.BackgroundColor3 = C.CARD_BG
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 11
+	b.TextColor3 = C.TEXT_GRAY
+	b.Text = def.label
+	b.Parent = U.shapeBtn
+	corner(b, 6)
+	methodButtons[def.id] = b
+	b.MouseButton1Click:Connect(function()
+		S.roofMode = def.id
+		clearStructure()
+		S.clearTraceRef()
+		if def.id == "trace" then S.harvestCornersRef() end
+		refreshMethod()
+		if def.id == "auto" then
+			flash("Auto Roof: click the plot to cap this level's walls")
+		elseif def.id == "rect" then
+			flash("Roof: tap a snap dot, drag across the roof grid, then release")
+		else
+			flash("Roof points: click wall corners")
+		end
+	end)
+end
+
+local pitchTitle = Instance.new("TextLabel")
+pitchTitle.Size = UDim2.new(1, 0, 0, 16)
+pitchTitle.Position = UDim2.fromOffset(0, 228)
+pitchTitle.BackgroundTransparency = 1
+pitchTitle.Font = Enum.Font.GothamBold
+pitchTitle.TextSize = 11
+pitchTitle.TextColor3 = C.TEXT_GRAY
+pitchTitle.Text = "PITCH"
+pitchTitle.Parent = U.shapeBtn
+
+local pitchButtons = {}
+local function refreshPitch()
+	for value, b in pairs(pitchButtons) do
+		local on = math.abs(value - roofPitch) < 0.01
+		b.BackgroundColor3 = on and C.ACCENT or C.CARD_BG
+		b.TextColor3 = on and C.WHITE or C.TEXT_GRAY
+	end
+end
+for i, def in ipairs(ROOF_PITCHES) do
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(44, 22)
+	b.Position = UDim2.fromOffset(6 + (i - 1) * 47, 246)
+	b.BackgroundColor3 = C.CARD_BG
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 11
+	b.TextColor3 = C.TEXT_GRAY
+	b.Text = def.label
+	b.Parent = U.shapeBtn
+	corner(b, 6)
+	pitchButtons[def.id] = b
+	b.MouseButton1Click:Connect(function()
+		roofPitch = def.id
+		S.roofGhostSig = nil
+		refreshPitch()
+	end)
+end
+
+refreshRoofUI()
+refreshPitch()
+refreshMethod()
+
+-- Large, touch-safe roof controls inspired by the reference placement UI.
+U.roofQuickBar = Instance.new("Frame")
+U.roofQuickBar.Size = UDim2.fromOffset(356, 48)
+U.roofQuickBar.AnchorPoint = Vector2.new(0.5, 1)
+U.roofQuickBar.Position = UDim2.new(0.5, 0, 1, -320)
+U.roofQuickBar.BackgroundColor3 = C.PANEL
+U.roofQuickBar.Visible = false
+U.roofQuickBar.Parent = U.gui
+corner(U.roofQuickBar, 12); stroke(U.roofQuickBar)
+
+local function roofQuick(text, x, w)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(w, 36)
+	b.Position = UDim2.fromOffset(x, 6)
+	b.BackgroundColor3 = C.CARD_BG
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 11
+	b.TextColor3 = C.TEXT_GRAY
+	b.Text = text
+	b.Parent = U.roofQuickBar
+	corner(b, 8)
+	return b
+end
+U.roofTurnBtn = roofQuick("Turn", 6, 64)
+U.roofSnapBtn = roofQuick("Grid: 1", 74, 78)
+U.roofEdgeDown = roofQuick("Edge -", 156, 62)
+U.roofEdgeLabel = roofQuick("Edge: 1", 222, 68)
+U.roofEdgeUp = roofQuick("Edge +", 294, 56)
+U.roofEdgeLabel.AutoButtonColor = false
+
+local function refreshRoofQuick()
+	U.roofSnapBtn.Text = "Grid: " .. tostring(S.roofSnap)
+	U.roofEdgeLabel.Text = "Edge: " .. tostring(S.roofOverhang)
+end
+U.roofTurnBtn.MouseButton1Click:Connect(function()
+	S.roofRotation = (S.roofRotation + 90) % 180
+	S.roofGhostSig = nil
+	flash("Roof turned " .. S.roofRotation .. "°")
+end)
+U.roofSnapBtn.MouseButton1Click:Connect(function()
+	S.roofSnap = (S.roofSnap == 1) and 2 or ((S.roofSnap == 2) and 4 or 1)
+	refreshRoofQuick()
+end)
+U.roofEdgeDown.MouseButton1Click:Connect(function()
+	S.roofOverhang = math.max(0, S.roofOverhang - 0.5)
+	refreshRoofQuick()
+end)
+U.roofEdgeUp.MouseButton1Click:Connect(function()
+	S.roofOverhang = math.min(4, S.roofOverhang + 0.5)
+	refreshRoofQuick()
+end)
+refreshRoofQuick()
+
+-- Tabs + cards
+U.tabRow = Instance.new("ScrollingFrame")
+U.tabRow.Size = UDim2.new(1, -20, 0, 28)
+U.tabRow.Position = UDim2.fromOffset(10, 88)
+U.tabRow.BackgroundTransparency = 1
+U.tabRow.ScrollBarThickness = 0
+U.tabRow.ScrollingDirection = Enum.ScrollingDirection.X
+U.tabRow.CanvasSize = UDim2.new()
+U.tabRow.AutomaticCanvasSize = Enum.AutomaticSize.X
+U.tabRow.Parent = U.dock
+U.tl = Instance.new("UIListLayout"); U.tl.FillDirection = Enum.FillDirection.Horizontal; U.tl.Padding = UDim.new(0, 6); U.tl.SortOrder = Enum.SortOrder.LayoutOrder; U.tl.Parent = U.tabRow
+
+U.cardScroll = Instance.new("ScrollingFrame")
+U.cardScroll.Size = UDim2.new(1, -20, 0, 112)
+U.cardScroll.Position = UDim2.fromOffset(10, 120)
+U.cardScroll.BackgroundTransparency = 1
+U.cardScroll.ScrollBarThickness = 4
+U.cardScroll.ScrollingDirection = Enum.ScrollingDirection.X
+U.cardScroll.CanvasSize = UDim2.new()
+U.cardScroll.AutomaticCanvasSize = Enum.AutomaticSize.X
+U.cardScroll.Parent = U.dock
+U.cl = Instance.new("UIListLayout"); U.cl.FillDirection = Enum.FillDirection.Horizontal; U.cl.Padding = UDim.new(0, 8); U.cl.Parent = U.cardScroll
+
+-- Paint: compact pill (always usable) + expandable settings panel
+local selectedMaterial, selectedColor, selectedTransparency = "SmoothPlastic", U.PAINT_COLORS[1], 0
+local eyedropper = false
+
+U.paintPill = Instance.new("TextButton")
+U.paintPill.Size = UDim2.fromOffset(120, 44)
+U.paintPill.AnchorPoint = Vector2.new(1, 1)
+U.paintPill.Position = UDim2.new(1, -14, 1, -262)
+U.paintPill.BackgroundColor3 = C.PANEL
+U.paintPill.Text = ""
+U.paintPill.Visible = false
+U.paintPill.Parent = U.gui
+corner(U.paintPill, 22); stroke(U.paintPill)
+
+U.pillSwatch = Instance.new("Frame")
+U.pillSwatch.Size = UDim2.fromOffset(28, 28)
+U.pillSwatch.Position = UDim2.fromOffset(8, 8)
+U.pillSwatch.BackgroundColor3 = selectedColor
+U.pillSwatch.Parent = U.paintPill
+corner(U.pillSwatch, 8)
+
+U.pillLabel = Instance.new("TextLabel")
+U.pillLabel.Size = UDim2.new(1, -44, 1, 0)
+U.pillLabel.Position = UDim2.fromOffset(42, 0)
+U.pillLabel.BackgroundTransparency = 1
+U.pillLabel.Font = Enum.Font.GothamBold
+U.pillLabel.TextSize = 11
+U.pillLabel.TextColor3 = C.TEXT_GRAY
+U.pillLabel.Text = "COLOR  ›"
+U.pillLabel.Parent = U.paintPill
+
+U.palette = Instance.new("Frame")
+U.palette.Size = UDim2.fromOffset(300, 400)
+U.palette.AnchorPoint = Vector2.new(1, 1)
+U.palette.Position = UDim2.new(1, -70, 1, -262)
+U.palette.BackgroundColor3 = C.PANEL
+U.palette.BackgroundTransparency = 0.03
+U.palette.Visible = false
+U.palette.Parent = U.gui
+corner(U.palette, 12); stroke(U.palette)
+
+local eyeBtn, updatePillSwatch
+do
+	local matLabel = Instance.new("TextLabel")
+	matLabel.Size = UDim2.new(1, 0, 0, 18); matLabel.BackgroundTransparency = 1
+	matLabel.Font = Enum.Font.GothamBold; matLabel.TextSize = 11; matLabel.TextColor3 = C.TEXT_GRAY
+	matLabel.Text = "MATERIAL"; matLabel.Parent = U.palette
+
+	local matButtons = {}
+	local function highlightMat()
+		for name, btn in pairs(matButtons) do
+			btn.BackgroundColor3 = (name == selectedMaterial) and C.ACCENT or C.CARD_BG
+			btn.TextColor3 = (name == selectedMaterial) and C.WHITE or C.TEXT_GRAY
+		end
+	end
+	for i, m in ipairs(U.MATERIALS) do
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.fromOffset(54, 20)
+		b.Position = UDim2.fromOffset(6 + ((i-1) % 5) * 58, 20 + math.floor((i-1) / 5) * 24)
+		b.BackgroundColor3 = C.CARD_BG
+		b.Font = Enum.Font.Gotham; b.TextSize = 8; b.TextColor3 = C.TEXT_GRAY
+		b.Text = m; b.Parent = U.palette
+		corner(b, 6)
+		matButtons[m] = b
+		b.MouseButton1Click:Connect(function()
+			selectedMaterial = m
+			highlightMat()
+			updatePillSwatch()
+		end)
+	end
+
+	local colLabel = Instance.new("TextLabel")
+	colLabel.Size = UDim2.new(1, 0, 0, 16); colLabel.Position = UDim2.fromOffset(0, 120)
+	colLabel.BackgroundTransparency = 1
+	colLabel.Font = Enum.Font.GothamBold; colLabel.TextSize = 11; colLabel.TextColor3 = C.TEXT_GRAY
+	colLabel.Text = "COLOR"; colLabel.Parent = U.palette
+
+	for i, col in ipairs(U.PAINT_COLORS) do
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.fromOffset(36, 22)
+		b.Position = UDim2.fromOffset(8 + ((i-1) % 6) * 47, 140 + math.floor((i-1) / 6) * 25)
+		b.BackgroundColor3 = col
+		b.Text = ""; b.Parent = U.palette
+		corner(b, 6)
+		b.MouseButton1Click:Connect(function()
+			selectedColor = col
+			updatePillSwatch()
+		end)
+	end
+
+	---------------- CUSTOM COLOR + TRANSPARENCY ----------------
+	local hue, sat, val = 0, 0, 1
+
+	local wheelLabel = Instance.new("TextLabel")
+	wheelLabel.Size = UDim2.new(1, -60, 0, 16)
+	wheelLabel.Position = UDim2.fromOffset(0, 244)
+	wheelLabel.BackgroundTransparency = 1
+	wheelLabel.Font = Enum.Font.GothamBold
+	wheelLabel.TextSize = 11
+	wheelLabel.TextColor3 = C.TEXT_GRAY
+	wheelLabel.Text = "CUSTOM COLOR + TRANSPARENCY"
+	wheelLabel.Parent = U.palette
+
+	local preview = Instance.new("Frame")
+	preview.Size = UDim2.fromOffset(36, 96)
+	preview.Position = UDim2.new(1, -44, 0, 264)
+	preview.BackgroundColor3 = Color3.fromHSV(0, 0, 1)
+	preview.Parent = U.palette
+	corner(preview, 8)
+	local pvs = Instance.new("UIStroke"); pvs.Color = C.PANEL_EDGE; pvs.Parent = preview
+
+	local satGrad, valGrad
+	local function refreshCustom()
+		selectedColor = Color3.fromHSV(hue, sat, val)
+		preview.BackgroundColor3 = selectedColor
+		preview.BackgroundTransparency = selectedTransparency
+		if satGrad then
+			satGrad.Color = ColorSequence.new(Color3.fromHSV(hue, 0, 1), Color3.fromHSV(hue, 1, 1))
+		end
+		if valGrad then
+			valGrad.Color = ColorSequence.new(Color3.new(0, 0, 0), Color3.fromHSV(hue, sat, 1))
+		end
+		updatePillSwatch()
+	end
+
+	local function makeSlider(y, gradient, setFrac, startFrac)
+		local bar = Instance.new("TextButton")
+		bar.Size = UDim2.fromOffset(200, 14)
+		bar.Position = UDim2.fromOffset(8, y)
+		bar.Text = ""
+		bar.BackgroundColor3 = C.CARD_BG
+		bar.AutoButtonColor = false
+		bar.Parent = U.palette
+		corner(bar, 7)
+		if gradient then gradient.Parent = bar end
+
+		local knob = Instance.new("Frame")
+		knob.Size = UDim2.fromOffset(4, 18)
+		knob.AnchorPoint = Vector2.new(0.5, 0.5)
+		knob.Position = UDim2.new(startFrac or 0, 0, 0.5, 0)
+		knob.BackgroundColor3 = Color3.fromRGB(120, 130, 145)
+		knob.Parent = bar
+		corner(knob, 2)
+
+		local draggingBar = false
+		local function applyAt(x)
+			local frac = math.clamp((x - bar.AbsolutePosition.X) / bar.AbsoluteSize.X, 0, 1)
+			setFrac(frac)
+			knob.Position = UDim2.new(frac, 0, 0.5, 0)
+			refreshCustom()
+		end
+		bar.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1
+				or input.UserInputType == Enum.UserInputType.Touch then
+				draggingBar = true
+				applyAt(input.Position.X)
+			end
+		end)
+		UserInputService.InputChanged:Connect(function(input)
+			if draggingBar and (input.UserInputType == Enum.UserInputType.MouseMovement
+				or input.UserInputType == Enum.UserInputType.Touch) then
+				applyAt(input.Position.X)
+			end
+		end)
+		UserInputService.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1
+				or input.UserInputType == Enum.UserInputType.Touch then
+				draggingBar = false
+			end
+		end)
+	end
+
+	local hueGrad = Instance.new("UIGradient")
+	local keys = {}
+	for i = 0, 6 do
+		table.insert(keys, ColorSequenceKeypoint.new(i / 6, Color3.fromHSV(i / 6 % 1, 1, 1)))
+	end
+	hueGrad.Color = ColorSequence.new(keys)
+	satGrad = Instance.new("UIGradient")
+	valGrad = Instance.new("UIGradient")
+	local traGrad = Instance.new("UIGradient")
+	traGrad.Color = ColorSequence.new(Color3.fromRGB(30,32,36), Color3.fromRGB(235,238,242))
+
+	makeSlider(264, hueGrad, function(f) hue = f end)
+	makeSlider(286, satGrad, function(f) sat = f end)
+	makeSlider(308, valGrad, function(f) val = f end, 1)
+	makeSlider(334, traGrad, function(f) selectedTransparency = math.floor(f * 0.9 * 100) / 100 end)
+
+	local traLabel = Instance.new("TextLabel")
+	traLabel.Size = UDim2.fromOffset(200, 12)
+	traLabel.Position = UDim2.fromOffset(8, 350)
+	traLabel.BackgroundTransparency = 1
+	traLabel.Font = Enum.Font.Gotham
+	traLabel.TextSize = 9
+	traLabel.TextColor3 = C.TEXT_GRAY
+	traLabel.Text = "^ transparency (right = see-through)"
+	traLabel.Parent = U.palette
+
+	-- Eyedropper + collapse
+	eyeBtn = Instance.new("TextButton")
+	eyeBtn.Size = UDim2.fromOffset(30, 22)
+	eyeBtn.Position = UDim2.new(1, -70, 0, 2)
+	eyeBtn.BackgroundColor3 = C.CARD_BG
+	eyeBtn.Font = Enum.Font.GothamBold
+	eyeBtn.TextSize = 10
+	eyeBtn.Text = "Pick"
+	eyeBtn.Parent = U.palette
+	corner(eyeBtn, 6)
+	eyeBtn.MouseButton1Click:Connect(function()
+		eyedropper = not eyedropper
+		eyeBtn.BackgroundColor3 = eyedropper and C.ACCENT or C.CARD_BG
+	end)
+
+	local collapseBtn = Instance.new("TextButton")
+	collapseBtn.Size = UDim2.fromOffset(30, 22)
+	collapseBtn.Position = UDim2.new(1, -36, 0, 2)
+	collapseBtn.BackgroundColor3 = C.CARD_BG
+	collapseBtn.Font = Enum.Font.GothamBold
+	collapseBtn.TextSize = 12
+	collapseBtn.TextColor3 = C.TEXT_GRAY
+	collapseBtn.Text = "▾"
+	collapseBtn.Parent = U.palette
+	corner(collapseBtn, 6)
+	collapseBtn.MouseButton1Click:Connect(function()
+		U.palette.Visible = false
+	end)
+
+	updatePillSwatch = function()
+		U.pillSwatch.BackgroundColor3 = selectedColor
+		U.pillSwatch.BackgroundTransparency = selectedTransparency
+	end
+	pillSwatchRef = function(col)
+		selectedColor = col
+		updatePillSwatch()
+	end
+	refreshCustom()
+end
+
+U.paintPill.MouseButton1Click:Connect(function()
+	U.palette.Visible = not U.palette.Visible
+end)
+
+-- Copy a structure's exact style into the current selection
+local function eyedropFrom(model)
+	local part = model and model.PrimaryPart
+	if not part then return end
+	selectedMaterial = part.Material.Name
+	selectedColor = part.Color
+	selectedTransparency = part.Transparency
+	U.pillSwatch.BackgroundColor3 = selectedColor
+	U.pillSwatch.BackgroundTransparency = selectedTransparency
+	eyedropper = false
+	if eyeBtn then eyeBtn.BackgroundColor3 = C.CARD_BG end
+	flash("Style copied!")
+end
+
+-- Select-mode floating toolbar: words instead of keyboard-only shortcuts.
+-- MouseButton1Click also fires from touch, so the same controls work on phones/tablets.
+U.selBar = Instance.new("Frame")
+U.selBar.Size = UDim2.fromOffset(684, 112)
+U.selBar.AnchorPoint = Vector2.new(0.5, 1)
+U.selBar.Position = UDim2.new(0.5, 0, 1, -262)
+U.selBar.BackgroundColor3 = C.PANEL
+U.selBar.Visible = false
+U.selBar.Parent = U.gui
+corner(U.selBar, 12); stroke(U.selBar)
+
+local function selBtn(text, x, w, color)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(w, 42)
+	b.Position = UDim2.fromOffset(x, 6)
+	b.BackgroundColor3 = C.CARD_BG
+	b.Font = Enum.Font.FredokaOne
+	b.TextSize = 12
+	b.TextColor3 = color or C.TEXT_GRAY
+	b.Text = text
+	b.Parent = U.selBar
+	corner(b, 9)
+	return b
+end
+U.scaleDown = selBtn("Smaller", 8, 76)
+U.scaleUp = selBtn("Bigger", 88, 76)
+U.selRotate = selBtn("Turn", 168, 72, C.ACCENT)
+U.selFlip = selBtn("Flip", 244, 72, C.ACCENT)
+U.selDup = selBtn("Copy", 320, 72, C.ACCENT)
+U.selStack = selBtn("Stack Up", 396, 86, C.GOLD)
+U.selDelete = selBtn("Delete", 486, 82, C.RED)
+U.selDone = selBtn("Done", 572, 104, C.GREEN)
+
+local function snapBtn(x, w)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(w, 30)
+	b.Position = UDim2.fromOffset(x, 58)
+	b.BackgroundColor3 = C.CARD_BG
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 10
+	b.TextColor3 = C.TEXT_GRAY
+	b.Parent = U.selBar
+	corner(b, 7)
+	return b
+end
+U.moveSnapBtn = snapBtn(8, 116)
+U.rotSnapBtn = snapBtn(128, 104)
+U.scaleStepBtn = snapBtn(236, 104)
+U.undoBtn = snapBtn(344, 96)
+U.undoBtn.Text = "Undo"
+U.stampBtn = snapBtn(444, 116)
+U.stampBtn.Text = "Repeat Copy"
+
+local function refreshSnapLabels()
+	U.moveSnapBtn.Text = "Move Grid: " .. moveSnap()
+	U.rotSnapBtn.Text = "Turn: " .. rotSnap() .. "°"
+	U.scaleStepBtn.Text = "Size: " .. scaleStep()
+end
+U.moveSnapBtn.MouseButton1Click:Connect(function()
+	moveSnapIdx = (moveSnapIdx % #U.MOVE_SNAPS) + 1
+	refreshSnapLabels()
+end)
+U.rotSnapBtn.MouseButton1Click:Connect(function()
+	rotSnapIdx = (rotSnapIdx % #U.ROT_SNAPS) + 1
+	refreshSnapLabels()
+end)
+U.scaleStepBtn.MouseButton1Click:Connect(function()
+	scaleStepIdx = (scaleStepIdx % #U.SCALE_STEPS) + 1
+	refreshSnapLabels()
+end)
+refreshSnapLabels()
+U.refreshStampButton = function()
+	U.stampBtn.BackgroundColor3 = S.stampMode and C.ACCENT or C.CARD_BG
+	U.stampBtn.TextColor3 = S.stampMode and C.WHITE or C.TEXT_GRAY
+	U.stampBtn.Text = S.stampMode and "Repeat: ON" or "Repeat Copy"
+	if U.boxStamp then
+		U.boxStamp.BackgroundColor3 = S.stampMode and C.ACCENT or C.CARD_BG
+		U.boxStamp.TextColor3 = S.stampMode and C.WHITE or C.TEXT_GRAY
+		U.boxStamp.Text = S.stampMode and "Repeat: ON" or "Repeat"
+	end
+end
+U.stampBtn.MouseButton1Click:Connect(function() S.toggleStamp() end)
+U.refreshStampButton()
+U.selHint = Instance.new("TextLabel")
+U.selHint.Size = UDim2.new(1, -16, 0, 18)
+U.selHint.Position = UDim2.fromOffset(8, 91)
+U.selHint.BackgroundTransparency = 1
+U.selHint.Font = Enum.Font.Gotham
+U.selHint.TextSize = 10
+U.selHint.TextColor3 = C.TEXT_GRAY
+U.selHint.Text = "Drag the item to move it • drag empty space to select many"
+U.selHint.Parent = U.selBar
+
+-- Floating rotate/cancel for ghost mode
+U.rotateBtn = Instance.new("TextButton")
+U.rotateBtn.Size = UDim2.fromOffset(72, 44); U.rotateBtn.AnchorPoint = Vector2.new(0.5, 1)
+U.rotateBtn.Position = UDim2.new(0.5, -42, 1, -262); U.rotateBtn.BackgroundColor3 = C.PANEL
+U.rotateBtn.Text = "Turn"; U.rotateBtn.Font = Enum.Font.FredokaOne; U.rotateBtn.TextSize = 12; U.rotateBtn.Visible = false; U.rotateBtn.Parent = U.gui
+U.rotateBtn.TextColor3 = C.TEXT_GRAY
+corner(U.rotateBtn, 12); stroke(U.rotateBtn)
+U.cancelBtn = Instance.new("TextButton")
+U.cancelBtn.Size = UDim2.fromOffset(72, 44); U.cancelBtn.AnchorPoint = Vector2.new(0.5, 1)
+U.cancelBtn.Position = UDim2.new(0.5, 42, 1, -262); U.cancelBtn.BackgroundColor3 = C.PANEL
+U.cancelBtn.TextColor3 = C.RED; U.cancelBtn.Text = "Cancel"; U.cancelBtn.Font = Enum.Font.FredokaOne; U.cancelBtn.TextSize = 11
+U.cancelBtn.Visible = false; U.cancelBtn.Parent = U.gui
+corner(U.cancelBtn, 12); stroke(U.cancelBtn)
+
+-- Window height setter: doors stay grounded; windows use a selectable sill.
+S.windowSills = { 1, 3, 5 }
+S.windowSillIndex = 2
+S.windowSill = S.windowSills[S.windowSillIndex]
+S.wallAttachTarget = nil
+U.windowBar = Instance.new("Frame")
+U.windowBar.Size = UDim2.fromOffset(286, 48)
+U.windowBar.AnchorPoint = Vector2.new(0.5, 1)
+U.windowBar.Position = UDim2.new(0.5, 0, 1, -320)
+U.windowBar.BackgroundColor3 = C.PANEL
+U.windowBar.Visible = false
+U.windowBar.Parent = U.gui
+corner(U.windowBar, 12); stroke(U.windowBar)
+
+local function windowButton(text, x, w)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(w, 36)
+	b.Position = UDim2.fromOffset(x, 6)
+	b.BackgroundColor3 = C.CARD_BG
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 12
+	b.TextColor3 = C.TEXT_GRAY
+	b.Text = text
+	b.Parent = U.windowBar
+	corner(b, 8)
+	return b
+end
+U.windowDown = windowButton("Lower", 6, 70)
+U.windowHeightLabel = windowButton("Window: Middle", 80, 126)
+U.windowHeightLabel.AutoButtonColor = false
+U.windowUp = windowButton("Higher", 210, 70)
+local function refreshWindowHeight()
+	local names = { "Low", "Middle", "High" }
+	S.windowSill = S.windowSills[S.windowSillIndex]
+	U.windowHeightLabel.Text = "Window: " .. names[S.windowSillIndex]
+end
+U.windowDown.MouseButton1Click:Connect(function()
+	S.windowSillIndex = math.max(1, S.windowSillIndex - 1)
+	refreshWindowHeight()
+end)
+U.windowUp.MouseButton1Click:Connect(function()
+	S.windowSillIndex = math.min(#S.windowSills, S.windowSillIndex + 1)
+	refreshWindowHeight()
+end)
+refreshWindowHeight()
+
+--------------------------------------------------------------------
+-- STATE
+--------------------------------------------------------------------
+mode = nil -- "ghost"|"remove"|"wall"|"floor"|"roof"|"paint"|"trim"|"select"
+local commitTransform -- forward-declared (defined in the selection section)
+local clearBoxSelectionRef -- forward-declared (box-select cleanup)
+local undoStack = {} -- recently placed items, newest last (declared early:
+-- the bulldoze button clears it long before the place code appears)
+local commitGroupRef = function(_) end -- assigned with the group helpers
+local refreshGroupHandlesRef = function() end
+local groupDupeRef, groupRotateRef, groupDeleteRef = function() end, function() end, function() end
+local selRotateRef = function() end
+local boxSelectionCount = function() return 0 end -- real version defined later
+local duplicateSelected, deleteSelected, undoLast -- forward-declared
+local ghost, ghostRotation, selectedItem, selectedSource = nil, 0, nil, "catalog"
+local ghostBottomDelta, ghostBoxOffset, ghostBoxSize = 0, nil, nil
+local ghostWallKind = nil -- "door"/"window" when the item carves walls
+local ghostWallFlip = false
+local ghostHighlight, colliding = nil, false
+local structStart, structPreview = nil, nil
+S.structEndX, S.structEndZ = nil, nil -- the snapped end the guideline shows
+
+U.hoverHighlight = Instance.new("Highlight")
+U.hoverHighlight.FillTransparency = 0.6
+
+-- Selection state
+local dragSelActive = false
+local dragSelPending = false
+local dragSelStart = nil -- screen pos at press
+local dragSelY = 0
+local dragSelOffset = Vector3.zero
+-- BOX-SELECT / GROUP STATE (declared up here: setMode, the handle
+-- callbacks and duplicateSelected all touch these long before the
+-- box-select section appears further down)
+local boxSelection = {}   -- [model] = Highlight
+local boxDragStart = nil
+local groupDragActive, groupDragY, groupDragOrigin, groupStartPivots = false, 0, Vector3.zero, nil
+-- after a duplicate, the fresh copies STICK TO THE CURSOR until you click
+-- to drop them - no need to release and re-grab
+local floatingCopies = false
+S.lastStampCenter = nil
+S.copyCellX, S.copyCellZ = 1, 1
+S.boxPressModel = nil -- model under the cursor when a box press began
+S.groupProxyStart = CFrame.new()
+-- invisible part at the centre of a box selection: the move arrows and
+-- rotation rings adorn to THIS, so groups get the same Studio handles
+local groupProxy = Instance.new("Part")
+groupProxy.Anchored = true
+groupProxy.CanCollide = false
+groupProxy.CanQuery = false
+groupProxy.Transparency = 1
+groupProxy.Size = Vector3.one
+groupProxy.Parent = camera
+local groupHandles = false
+local groupHandleStart = nil
+local handleGrab = false -- true while any Studio handle is being dragged
+local flying = false -- forward-declared so free-cam state is visible here
+
+local selModel = nil
+local selPlot = nil -- the plot Part the selected item lives on
+local selScale = 1
+S.toggleStamp = function()
+	if not (selModel or boxSelectionCount() > 0 or floatingCopies) then
+		flash("Select furniture or a wall group first")
+		return
+	end
+	S.stampMode = not S.stampMode
+	U.refreshStampButton()
+	flash(S.stampMode and "Stamp copy ON: click or hold-drag to repeat" or "Stamp copy OFF")
+end
+U.selBox = Instance.new("SelectionBox")
+U.selBox.LineThickness = 0.05
+U.selBox.Color3 = C.ACCENT
+U.moveHandles = Instance.new("Handles")
+U.moveHandles.Style = Enum.HandlesStyle.Movement
+U.moveHandles.Color3 = C.ACCENT
+U.arcHandles = Instance.new("ArcHandles")
+U.arcHandles.Color3 = C.GOLD
+U.arcHandles.Axes = Axes.new(Enum.Axis.Y) -- Bloxburg-style: upright yaw only
+U.resizeHandles = Instance.new("Handles")
+U.resizeHandles.Style = Enum.HandlesStyle.Resize
+U.resizeHandles.Color3 = C.GREEN
+-- Adornments must live directly under PlayerGui - inside a ScreenGui
+-- they can fail to render/receive input, which made selection look
+-- completely dead all along
+U.adornRoot = player:WaitForChild("PlayerGui")
+U.selBox.Parent = U.adornRoot
+U.moveHandles.Parent = U.adornRoot
+U.arcHandles.Parent = U.adornRoot
+U.resizeHandles.Parent = U.adornRoot
+
+U.overlapParams = OverlapParams.new()
+U.overlapParams.FilterType = Enum.RaycastFilterType.Include
+U.rayParams = RaycastParams.new()
+U.rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+--------------------------------------------------------------------
+-- BUILD PLANE (construction happens ON this, at the selected level)
+--------------------------------------------------------------------
+local plotsFolderRef = workspace:WaitForChild("Plots", 10)
+local gridPlane = nil
+-- (refreshGridPlane is forward-declared near the top of the file)
+
+local function myPlotPart()
+	if not plotsFolderRef then return nil end
+	local char = player.Character
+	local root = char and char:FindFirstChild("HumanoidRootPart")
+	if not root then return nil end
+	for _, plot in ipairs(plotsFolderRef:GetChildren()) do
+		if plot:IsA("BasePart") then
+			local rel = plot.CFrame:PointToObjectSpace(root.Position)
+			if math.abs(rel.X) <= plot.Size.X/2 + 6 and math.abs(rel.Z) <= plot.Size.Z/2 + 6 then
+				return plot
+			end
+		end
+	end
+	return nil
+end
+
+-- The plot and plane height are LOCKED IN when a construction tool is
+-- activated (and when the level changes). Recomputing them every frame
+-- from the character's position is what made the guideline wobble.
+S.activePlot, S.activePlaneY = nil, nil
+
+local function buildPlaneY()
+	if S.activePlaneY then return S.activePlaneY end
+	local plot = myPlotPart()
+	if not plot then return nil end
+	return plot.Position.Y + plot.Size.Y/2 + currentLevel * WALL_HEIGHT
+end
+
+lockBuildPlane = function()
+	S.activePlot = myPlotPart()
+	S.activePlaneY = S.activePlot
+		and (S.activePlot.Position.Y + S.activePlot.Size.Y/2 + currentLevel * WALL_HEIGHT)
+		or nil
+end
+
+releaseBuildPlane = function()
+	S.activePlot, S.activePlaneY = nil, nil
+end
+
+refreshGridPlane = function()
+	if gridPlane then gridPlane:Destroy() gridPlane = nil end
+	if not U.dock.Visible then return end
+	local plot = S.activePlot or myPlotPart()
+	local y = buildPlaneY()
+	if not (plot and y) then return end
+
+	-- A single non-queryable surface carries the whole visual grid.  This is
+	-- substantially cheaper than spawning one 3D Part for every grid line.
+	gridPlane = Instance.new("Part")
+	gridPlane.Name = "BuildGrid"
+	gridPlane.Size = Vector3.new(plot.Size.X, 0.04, plot.Size.Z)
+	-- Roof placement happens at the TOP of the current story. Showing the
+	-- grid down on the floor made the cursor footprint look disconnected.
+	local gridY = y + ((mode == "roof") and WALL_HEIGHT or 0)
+	gridPlane.CFrame = CFrame.new(plot.Position.X, gridY + 0.025, plot.Position.Z) * plot.CFrame.Rotation
+	gridPlane.Anchored = true
+	gridPlane.CanCollide = false
+	gridPlane.CanTouch = false
+	gridPlane.CanQuery = false
+	gridPlane.CastShadow = false
+	gridPlane.Transparency = 0.94
+	gridPlane.Color = Color3.fromRGB(248, 251, 255) -- v9: soft light plane
+	gridPlane.Material = Enum.Material.SmoothPlastic
+	gridPlane.Parent = camera
+
+	local pixelsPerStud = 12
+	local surface = Instance.new("SurfaceGui")
+	surface.Name = "GridLines"
+	surface.Face = Enum.NormalId.Top
+	surface.AlwaysOnTop = false
+	surface.LightInfluence = 0
+	surface.Brightness = 1.5
+	surface.CanvasSize = Vector2.new(
+		math.max(1, math.floor(plot.Size.X * pixelsPerStud + 0.5)),
+		math.max(1, math.floor(plot.Size.Z * pixelsPerStud + 0.5))
+	)
+	surface.Parent = gridPlane
+
+	local canvasX, canvasY = surface.CanvasSize.X, surface.CanvasSize.Y
+	local studsX, studsZ = math.floor(plot.Size.X + 0.5), math.floor(plot.Size.Z + 0.5)
+	local function addLine(vertical, stud, totalStuds, totalPixels)
+		local major = stud % 4 == 0
+		local line = Instance.new("Frame")
+		line.Name = major and "Major" or "Minor"
+		line.BorderSizePixel = 0
+		-- v9: sky-blue pastel grid to match the interface
+		line.BackgroundColor3 = major and Color3.fromRGB(96, 175, 255) or Color3.fromRGB(150, 200, 255)
+		line.BackgroundTransparency = major and 0.26 or 0.52
+		local px = math.max(1, major and 2 or 1)
+		local position = math.floor((stud / math.max(totalStuds, 1)) * totalPixels + 0.5)
+		if vertical then
+			line.Size = UDim2.fromOffset(px, canvasY)
+			line.Position = UDim2.fromOffset(math.clamp(position, 0, canvasX - px), 0)
+		else
+			line.Size = UDim2.fromOffset(canvasX, px)
+			line.Position = UDim2.fromOffset(0, math.clamp(position, 0, canvasY - px))
+		end
+		line.Parent = surface
+	end
+
+	for stud = 0, studsX do addLine(true, stud, studsX, canvasX) end
+	for stud = 0, studsZ do addLine(false, stud, studsZ, canvasY) end
+end
+
+-- Snap a point to the grid RELATIVE TO THE PLOT (grid starts at the
+-- plot corner), clamped to its edges - walls/floors align 1:1 with pads
+local function snapStruct(point)
+	local plot = S.activePlot or myPlotPart()
+	if not plot then
+		return math.round(point.X / WGRID) * WGRID, math.round(point.Z / WGRID) * WGRID
+	end
+	local rel = plot.CFrame:PointToObjectSpace(point)
+	local hx, hz = plot.Size.X / 2, plot.Size.Z / 2
+	local snap = (mode == "roof") and S.roofSnap or WGRID
+	local rx = math.clamp(math.round((rel.X + hx) / snap) * snap - hx, -hx, hx)
+	local rz = math.clamp(math.round((rel.Z + hz) / snap) * snap - hz, -hz, hz)
+	local wp = plot.CFrame:PointToWorldSpace(Vector3.new(rx, rel.Y, rz))
+	return wp.X, wp.Z
+end
+
+-- Intersect the mouse ray with the build plane (math, not raycast) so
+-- upper floors and basements get accurate cursor points
+-- Rectangular roofs can magnetize to the same wall corners used by the
+-- point-roof tool. This makes Drag Roof feel attached to the building rather
+-- than merely rounded to an invisible world grid.
+S.snapRoofPoint = function(x, z)
+	local bestX, bestZ, bestDist = x, z, math.huge
+	local radius = math.max(1.25, (S.roofSnap or 1) * 0.9)
+	for _, dot in ipairs(S.snapDots or {}) do
+		if dot and dot.Parent then
+			local dx, dz = dot.Position.X - x, dot.Position.Z - z
+			local distance = math.sqrt(dx * dx + dz * dz)
+			if distance < bestDist and distance <= radius then
+				bestX, bestZ, bestDist = dot.Position.X, dot.Position.Z, distance
+			end
+		end
+	end
+	return bestX, bestZ, bestDist < math.huge
+end
+
+local function planePoint()
+	local y = buildPlaneY()
+	if not y then return nil end
+	local unitRay = camera:ScreenPointToRay(mouse.X, mouse.Y)
+	local dir = unitRay.Direction
+	if math.abs(dir.Y) < 1e-4 then return nil end
+	local t = (y - unitRay.Origin.Y) / dir.Y
+	if t < 0 or t > 600 then return nil end
+	local p = unitRay.Origin + dir * t
+	return Vector3.new(p.X, y, p.Z)
+end
+
+local function clearStructure()
+	S.structDragging = false
+	if S.wallSnapMarker then S.wallSnapMarker.Transparency = 1 end
+	structStart = nil
+	for _, markerPart in ipairs(S.roofMarkers) do
+		if markerPart then markerPart:Destroy() end
+	end
+	table.clear(S.roofMarkers)
+	S.structEndX, S.structEndZ = nil, nil
+	if S.roofGhost then S.roofGhost:Destroy() S.roofGhost = nil end
+	S.roofGhostSig = nil
+	if structPreview then structPreview:Destroy() structPreview = nil end
+end
+
+local function clearGhost()
+	if ghost then ghost:Destroy() ghost = nil end
+	selectedItem = nil
+	ghostHighlight = nil
+	S.wallAttachTarget = nil
+	U.windowBar.Visible = false
+end
+
+local function deselect()
+	selModel = nil
+	selPlot = nil
+	U.selBox.Adornee = nil
+	U.moveHandles.Adornee = nil
+	U.arcHandles.Adornee = nil
+	U.resizeHandles.Adornee = nil
+	U.selBar.Visible = false
+end
+
+local function setMode(newMode)
+	clearGhost(); clearStructure(); deselect()
+	floatingCopies = false
+	if clearBoxSelectionRef then clearBoxSelectionRef() end
+	U.hoverHighlight.Parent = nil
+	mode = newMode
+	if newMode ~= "select" then
+		S.stampMode, S.stampHeld = false, false
+		U.refreshStampButton()
+	end
+	U.rotateBtn.Visible = (newMode == "ghost")
+	U.cancelBtn.Visible = (newMode ~= nil)
+	-- door/window need no extra UI: hover a wall and click
+	U.paintPill.Visible = (newMode == "paint" or newMode == "trim")
+	if newMode ~= "paint" then U.palette.Visible = false end
+	eyedropper = false
+	U.levelFrame.Visible = (newMode == "wall" or newMode == "floor" or newMode == "roof")
+	U.shapeBtn.Visible = (newMode == "roof")
+	U.roofQuickBar.Visible = (newMode == "roof")
+	U.trimPanel.Visible = (newMode == "trim")
+	U.wallPanel.Visible = (newMode == "wall")
+	U.windowBar.Visible = false
+	S.clearTraceRef()
+	if newMode == "wall" or newMode == "floor" or newMode == "roof" then
+		lockBuildPlane()
+		if newMode == "roof" then S.harvestCornersRef() end
+	else
+		releaseBuildPlane()
+		U.header.Text = "BUILD MODE"
+	end
+	refreshGridPlane()
+	refreshLevelView()
+	for id, b in pairs(U.toolButtons) do
+		local active = (id == newMode)
+		b.BackgroundColor3 = active and C.ACCENT or C.CARD_BG
+		if U.toolLabels[id] then
+			U.toolLabels[id].TextColor3 = active and C.WHITE
+				or (id == "remove" and C.RED or C.TEXT_GRAY)
+		end
+	end
+end
+
+--------------------------------------------------------------------
+-- HELPERS
+--------------------------------------------------------------------
+local function mouseHit()
+	U.rayParams.FilterDescendantsInstances = { ghost, structPreview, player.Character }
+	local unitRay = camera:ScreenPointToRay(mouse.X, mouse.Y)
+	return workspace:Raycast(unitRay.Origin, unitRay.Direction * 400, U.rayParams)
+end
+
+local function climbToPlaced(inst)
+	local node = inst
+	while node and node ~= workspace do
+		if node:IsA("Model") then
+			local parent = node.Parent
+			if (parent and parent.Parent == itemsRoot)
+				or node:GetAttribute("PlotIndex") ~= nil
+				or node:GetAttribute("StructureKind") ~= nil then
+				return node
+			end
+		end
+		node = node.Parent
+	end
+	return nil
+end
+
+U.placedRay = RaycastParams.new()
+U.placedRay.FilterType = Enum.RaycastFilterType.Include
+
+-- Model + the exact raycast hit (part, position, normal) when available
+local function placedHit()
+	if not itemsRoot then return nil, nil end
+	U.placedRay.FilterDescendantsInstances = { itemsRoot }
+	local unitRay = camera:ScreenPointToRay(mouse.X, mouse.Y)
+	local origin = unitRay.Origin
+	-- step through fully-invisible helper parts so selection lands on visible geometry
+	for _ = 1, 5 do
+		local hit = workspace:Raycast(origin, unitRay.Direction * 400, U.placedRay)
+		if not hit then break end
+		if hit.Instance.Transparency < 0.95 then
+			local model = climbToPlaced(hit.Instance)
+			if model then return model, hit end
+			break
+		end
+		origin = hit.Position + unitRay.Direction * 0.1
+	end
+	return nil, nil
+end
+
+local function placedModelUnderMouse()
+	if not itemsRoot then return nil end
+	-- normal cursor hit first
+	if mouse.Target then
+		local m = climbToPlaced(mouse.Target)
+		if m then return m end
+	end
+	-- fallback: ray against placed items ONLY (catches thin props,
+	-- foliage, and anything the cursor test misses)
+	U.placedRay.FilterDescendantsInstances = { itemsRoot }
+	local unitRay = camera:ScreenPointToRay(mouse.X, mouse.Y)
+	local hit = workspace:Raycast(unitRay.Origin, unitRay.Direction * 400, U.placedRay)
+	if hit then
+		return climbToPlaced(hit.Instance)
+	end
+	return nil
+end
+
+local function makeGhost(itemName, source)
+	local template = findTemplate(itemName)
+	if not template then flash("Item not found!") return end
+	if not ensurePrimaryPart(template) then flash("Item has no parts!") return end
+	setMode("ghost")
+	selectedItem = itemName
+	selectedSource = source or "catalog"
+	ghostRotation = 0
+	ghost = template:Clone()
+	ensurePrimaryPart(ghost)
+	for _, part in ipairs(ghost:GetDescendants()) do
+		if part:IsA("BasePart") then
+			part.Transparency = math.max(part.Transparency, 0.5)
+			part.CanCollide = false; part.CanQuery = false; part.Anchored = true
+		end
+	end
+	-- compute geometry BEFORE the ghost becomes visible to the update
+	-- loop (running one frame early with stale values could error and
+	-- permanently kill the loop)
+	local bboxCF, bboxSize = ghost:GetBoundingBox()
+	local pivot = ghost:GetPivot()
+	ghostBottomDelta = pivot.Position.Y - (bboxCF.Position.Y - bboxSize.Y / 2)
+	ghostBoxOffset = pivot:ToObjectSpace(bboxCF)
+	ghostBoxSize = bboxSize
+	ghostWallKind = nil
+	do
+		local attr = findTemplate(itemName) and findTemplate(itemName):GetAttribute("WallItem")
+		if attr == "door" or attr == "window" then
+			ghostWallKind = attr
+		else
+			local t = findTemplate(itemName)
+			local parent = t and t.Parent
+			if parent and parent:IsA("Folder") then
+				local n = parent.Name:lower()
+				if n == "doors" then ghostWallKind = "door" end
+				if n == "windows" then ghostWallKind = "window" end
+			end
+		end
+	end
+	ghostHighlight = Instance.new("Highlight")
+	ghostHighlight.FillTransparency = 0.7
+	ghostHighlight.Parent = ghost
+	ghost.Parent = camera
+end
+
+-- Selection bounds helpers
+local function plotOfModel(model)
+	if not plotsFolderRef then return nil end
+	local pivot = model:GetPivot().Position
+	for _, plot in ipairs(plotsFolderRef:GetChildren()) do
+		if plot:IsA("BasePart") then
+			local rel = plot.CFrame:PointToObjectSpace(pivot)
+			if math.abs(rel.X) <= plot.Size.X/2 + 2 and math.abs(rel.Z) <= plot.Size.Z/2 + 2 then
+				return plot
+			end
+		end
+	end
+	return nil
+end
+
+local function buildLevelOfModel(model, plot)
+	local tagged = model:GetAttribute("Level")
+	if typeof(tagged) == "number" then return math.round(tagged) end
+	plot = plot or plotOfModel(model)
+	if not plot then return 0 end
+	local plotTop = plot.Position.Y + plot.Size.Y / 2
+	local baseY
+	if model.Name == "__Wall" and model.PrimaryPart then
+		baseY = model.PrimaryPart.Position.Y - model.PrimaryPart.Size.Y / 2
+	elseif model.Name == "__Roof" then
+		local _, size = model:GetBoundingBox()
+		baseY = model:GetPivot().Position.Y - math.max(size.Y / 2, 0) - WALL_HEIGHT + ROOF_FLOOR_GAP
+	else
+		local box, size = model:GetBoundingBox()
+		baseY = box.Position.Y - size.Y / 2
+	end
+	return math.clamp(math.round((baseY - plotTop) / WALL_HEIGHT), MIN_LEVEL, MAX_LEVEL)
+end
+
+-- Visual feedback and geometry lookup live behind S fields so this large
+-- LocalScript does not consume more top-level local registers.
+S.showWallSnapMarker = function(info)
+	if not info then
+		if S.wallSnapMarker then S.wallSnapMarker.Transparency = 1 end
+		return
+	end
+	if not S.wallSnapMarker then
+		local marker = Instance.new("Part")
+		marker.Name = "WallSnapMarker"
+		marker.Shape = Enum.PartType.Ball
+		marker.Size = Vector3.new(0.48, 0.48, 0.48)
+		marker.Anchored = true
+		marker.CanCollide = false
+		marker.CanTouch = false
+		marker.CanQuery = false
+		marker.CastShadow = false
+		marker.Material = Enum.Material.Neon
+		marker.Parent = camera
+		S.wallSnapMarker = marker
+	end
+	S.wallSnapMarker.Color = (info.kind == "corner") and C.ACCENT or C.GREEN
+	S.wallSnapMarker.Position = Vector3.new(
+		info.position.X,
+		(buildPlaneY() or info.position.Y) + 0.18,
+		info.position.Z
+	)
+	S.wallSnapMarker.Transparency = 0.05
+end
+
+S.snapWallPoint = function(x, z)
+	if not (mode == "wall" and S.wallSnapEnabled and S.WallSnap and S.activePlot and itemsRoot) then
+		S.showWallSnapMarker(nil)
+		return x, z, nil
+	end
+	local point, info = S.WallSnap.SnapPoint({
+		point = Vector3.new(x, buildPlaneY() or 0, z),
+		plot = S.activePlot,
+		itemsRoot = itemsRoot,
+		level = currentLevel,
+		wallHeight = WALL_HEIGHT,
+		grid = WGRID,
+		radius = S.wallSnapRadius,
+		allowSegments = true,
+	})
+	S.showWallSnapMarker(info)
+	if info then return point.X, point.Z, info end
+	return x, z, nil
+end
+
+S.resetLevelView = function()
+	if not itemsRoot then return end
+	for _, descendant in ipairs(itemsRoot:GetDescendants()) do
+		if descendant:IsA("BasePart") then descendant.LocalTransparencyModifier = 0 end
+	end
+end
+
+refreshLevelView = function()
+	U.focusViewBtn.Text = S.focusLevelView and "Floor Focus: ON" or "Floor Focus: OFF"
+	U.focusViewBtn.BackgroundColor3 = S.focusLevelView and C.ACCENT or C.CARD_BG
+	U.focusViewBtn.TextColor3 = S.focusLevelView and C.WHITE or C.TEXT_GRAY
+	U.hideRoofsBtn.Text = S.hideRoofs and "Roofs: HIDDEN" or "Roofs: SHOW"
+	U.hideRoofsBtn.BackgroundColor3 = S.hideRoofs and C.ACCENT or C.CARD_BG
+	U.hideRoofsBtn.TextColor3 = S.hideRoofs and C.WHITE or C.TEXT_GRAY
+	if not itemsRoot then return end
+	local activePlot = S.activePlot or myPlotPart()
+	for _, plotFolder in ipairs(itemsRoot:GetChildren()) do
+		for _, model in ipairs(plotFolder:GetChildren()) do
+			if model:IsA("Model") then
+				local ownPlot = plotOfModel(model)
+				local alpha = 0
+				if activePlot and ownPlot == activePlot then
+					local level = buildLevelOfModel(model, ownPlot)
+					if S.hideRoofs and model.Name == "__Roof" then
+						alpha = 1
+					elseif S.focusLevelView then
+						if level > currentLevel then alpha = 1
+						elseif level < currentLevel then alpha = 0.62 end
+					end
+				end
+				for _, part in ipairs(model:GetDescendants()) do
+					if part:IsA("BasePart") then part.LocalTransparencyModifier = alpha end
+				end
+			end
+		end
+	end
+end
+
+-- Projected half-extents of an oriented box onto the plot's X/Z axes
+local function projectedHalves(relRotation, size)
+	local hx, hy, hz = size.X/2, size.Y/2, size.Z/2
+	local r, u, l = relRotation.XVector, relRotation.YVector, relRotation.ZVector
+	local px = math.abs(r.X)*hx + math.abs(u.X)*hy + math.abs(l.X)*hz
+	local pz = math.abs(r.Z)*hx + math.abs(u.Z)*hy + math.abs(l.Z)*hz
+	return px, pz
+end
+
+-- Clamp a pivot CFrame so the model's footprint stays on its plot
+-- (per-axis, orientation-aware - long walls slide along edges freely)
+local function clampToPlot(cf, model)
+	if not selPlot then return cf end
+	local bcf, size = model:GetBoundingBox()
+	local pivotToBox = model:GetPivot():ToObjectSpace(bcf)
+	local rel = selPlot.CFrame:ToObjectSpace(cf * pivotToBox)
+	local px, pz = projectedHalves(rel.Rotation, size)
+	local limX = math.max(selPlot.Size.X/2 - px, 0)
+	local limZ = math.max(selPlot.Size.Z/2 - pz, 0)
+	local clampedBox = CFrame.new(
+		math.clamp(rel.Position.X, -limX, limX),
+		rel.Position.Y,
+		math.clamp(rel.Position.Z, -limZ, limZ)
+	) * rel.Rotation
+	return selPlot.CFrame:ToWorldSpace(clampedBox) * pivotToBox:Inverse()
+end
+
+-- Stream the drag to the server (throttled) so OTHER players watch it
+-- move live instead of it teleporting on release
+local lastSync = 0
+local function liveSync()
+	if os.clock() - lastSync < 0.15 then return end
+	lastSync = os.clock()
+	task.spawn(commitTransform)
+end
+
+-- Snapshot to restore if the server rejects the final position
+local gestureSnapshot = nil
+local function takeSnapshot()
+	if not selModel then return end
+	gestureSnapshot = { pivot = selModel:GetPivot() }
+	pcall(function() gestureSnapshot.scale = selModel:GetScale() end)
+	local part = selModel.PrimaryPart
+	if part then
+		gestureSnapshot.size = part.Size
+		gestureSnapshot.cf = part.CFrame
+	end
+end
+local function restoreSnapshot()
+	if not (selModel and gestureSnapshot) then return end
+	if S.isStructure(selModel) and selModel.PrimaryPart and gestureSnapshot.size then
+		selModel.PrimaryPart.Size = gestureSnapshot.size
+		selModel.PrimaryPart.CFrame = gestureSnapshot.cf
+	else
+		if gestureSnapshot.scale then
+			pcall(function() selModel:ScaleTo(gestureSnapshot.scale) end)
+			selScale = gestureSnapshot.scale
+		end
+		selModel:PivotTo(gestureSnapshot.pivot)
+	end
+end
+
+--------------------------------------------------------------------
+-- SELECTION (Studio-style handles)
+--------------------------------------------------------------------
+commitTransform = function()
+	if not selModel then return true end
+	local pivot = selModel:GetPivot()
+	if S.isStructure(selModel) then
+		local part = selModel.PrimaryPart
+		if not part then return true end
+		local prx, pry, prz = part.CFrame:ToOrientation()
+		local ok, err = buildRemote:InvokeServer({
+			action = "resize", target = selModel,
+			sx = part.Size.X, sy = part.Size.Y, sz = part.Size.Z,
+			x = part.Position.X, y = part.Position.Y, z = part.Position.Z,
+			rot = pry, rx = prx, rz = prz,
+		})
+		if not ok and err then flash(tostring(err)) end
+		return ok
+	else
+		local rxO, ryO, rzO = pivot:ToOrientation()
+		local actualScale = selScale
+		pcall(function() actualScale = selModel:GetScale() end)
+		selScale = actualScale
+		local ok, err = buildRemote:InvokeServer({
+			action = "transform", target = selModel,
+			x = pivot.Position.X, y = pivot.Position.Y, z = pivot.Position.Z,
+			rot = ryO, rx = rxO, rz = rzO, scale = actualScale,
+		})
+		if not ok and err then flash(tostring(err)) end
+		return ok
+	end
+end
+
+local function select(model)
+	if clearBoxSelectionRef then clearBoxSelectionRef() end
+	deselect()
+	selModel = model
+	selPlot = plotOfModel(model)
+	selScale = 1
+	pcall(function() selScale = model:GetScale() end)
+	local part = model.PrimaryPart
+	if not part then ensurePrimaryPart(model) part = model.PrimaryPart end
+	if not part then return end
+	U.selBox.Adornee = model
+	U.moveHandles.Adornee = part
+	-- Structures stay upright. Furniture gets all three rotation rings so
+	-- advanced placement is possible without breaking wall/floor alignment.
+	U.arcHandles.Axes = S.isStructure(model)
+		and Axes.new(Enum.Axis.Y)
+		or Axes.new(Enum.Axis.X, Enum.Axis.Y, Enum.Axis.Z)
+	U.arcHandles.Adornee = part
+	U.resizeHandles.Adornee = S.isStructure(model) and part or nil
+	U.scaleUp.Visible = true
+	U.scaleDown.Visible = true
+	U.selBar.Visible = true
+end
+
+-- Drag math
+local dragStart = nil
+U.moveHandles.MouseButton1Down:Connect(function()
+	handleGrab = true
+	if groupHandles then
+		groupHandleStart = {}
+		for model in pairs(boxSelection) do
+			groupHandleStart[model] = model:GetPivot()
+		end
+		groupHandleStart.__proxy = groupProxy.CFrame
+		return
+	end
+	if selModel then
+		dragSelPending = false -- handle takes priority over item-drag
+		dragStart = selModel:GetPivot()
+		takeSnapshot()
+	end
+end)
+U.moveHandles.MouseDrag:Connect(function(face, distance)
+	if groupHandles and groupHandleStart then
+		local dir = Vector3.fromNormalId(face)
+		local snapped = math.round(distance / moveSnap()) * moveSnap()
+		local delta = dir * snapped
+		for model, startPivot in pairs(groupHandleStart) do
+			if model ~= "__proxy" and typeof(model) == "Instance" and model.Parent then
+				model:PivotTo(startPivot + delta)
+			end
+		end
+		groupProxy.CFrame = groupHandleStart.__proxy + delta
+		return
+	end
+	if not (selModel and dragStart) then return end
+	local dir = Vector3.fromNormalId(face)
+	local snapped = math.round(distance / moveSnap()) * moveSnap()
+	local target = clampToPlot(dragStart * CFrame.new(dir * snapped), selModel)
+	selModel:PivotTo(target)
+	liveSync()
+end)
+U.moveHandles.MouseButton1Up:Connect(function()
+	handleGrab = false
+	if groupHandles then
+		local starts = groupHandleStart
+		groupHandleStart = nil
+		commitGroupRef(starts)
+		refreshGroupHandlesRef()
+		return
+	end
+	dragStart = nil
+	if not commitTransform() then restoreSnapshot() end
+end)
+
+local rotStart = nil
+U.arcHandles.MouseButton1Down:Connect(function()
+	handleGrab = true
+	if groupHandles then
+		groupHandleStart = {}
+		for model in pairs(boxSelection) do
+			groupHandleStart[model] = model:GetPivot()
+		end
+		groupHandleStart.__proxy = groupProxy.CFrame
+		return
+	end
+	if selModel then
+		dragSelPending = false
+		rotStart = selModel:GetPivot()
+		takeSnapshot()
+	end
+end)
+U.arcHandles.MouseDrag:Connect(function(axis, relativeAngle)
+	if groupHandles and groupHandleStart then
+		local rs = rotSnap()
+		local snapped = math.rad(math.round(math.deg(relativeAngle) / rs) * rs)
+		local dir = Vector3.new(
+			axis == Enum.Axis.X and 1 or 0,
+			axis == Enum.Axis.Y and 1 or 0,
+			axis == Enum.Axis.Z and 1 or 0
+		)
+		local turn = CFrame.fromAxisAngle(dir, snapped)
+		local center = groupHandleStart.__proxy.Position
+		for model, startPivot in pairs(groupHandleStart) do
+			if model ~= "__proxy" and typeof(model) == "Instance" and model.Parent then
+				local offset = startPivot.Position - center
+				model:PivotTo(CFrame.new(center + turn * offset) * (turn * startPivot.Rotation))
+			end
+		end
+		return
+	end
+	if not (selModel and rotStart) then return end
+	-- rotate about whichever ring was grabbed (X/Z = vertical tilts)
+	local dir = Vector3.new(
+		axis == Enum.Axis.X and 1 or 0,
+		axis == Enum.Axis.Y and 1 or 0,
+		axis == Enum.Axis.Z and 1 or 0
+	)
+	local rs = rotSnap()
+	local snapped = math.rad(math.round(math.deg(relativeAngle) / rs) * rs)
+	selModel:PivotTo(clampToPlot(rotStart * CFrame.fromAxisAngle(dir, snapped), selModel))
+	liveSync()
+end)
+U.arcHandles.MouseButton1Up:Connect(function()
+	handleGrab = false
+	if groupHandles then
+		local starts = groupHandleStart
+		groupHandleStart = nil
+		commitGroupRef(starts)
+		refreshGroupHandlesRef()
+		return
+	end
+	rotStart = nil
+	if not commitTransform() then restoreSnapshot() end
+end)
+
+local sizeStart, cfStart = nil, nil
+U.resizeHandles.MouseButton1Down:Connect(function()
+	handleGrab = true
+	local part = selModel and selModel.PrimaryPart
+	if part then
+		dragSelPending = false
+		sizeStart, cfStart = part.Size, part.CFrame
+		takeSnapshot()
+	end
+end)
+U.resizeHandles.MouseDrag:Connect(function(face, distance)
+	local part = selModel and selModel.PrimaryPart
+	if not (part and sizeStart and cfStart) then return end
+	local dir = Vector3.fromNormalId(face)
+	local snapped = math.round(distance / moveSnap()) * moveSnap()
+	local absDir = Vector3.new(math.abs(dir.X), math.abs(dir.Y), math.abs(dir.Z))
+	local newSize = sizeStart + absDir * snapped
+	newSize = Vector3.new(math.max(newSize.X, 0.4), math.max(newSize.Y, 0.4), math.max(newSize.Z, 0.4))
+	local shift = dir * ((newSize - sizeStart):Dot(absDir)) / 2
+	-- Stop growing at the plot edge (client-side; server enforces too)
+	local newCF = cfStart * CFrame.new(shift)
+	if selPlot then
+		local rel = selPlot.CFrame:ToObjectSpace(newCF)
+		local px, pz = projectedHalves(rel.Rotation, newSize)
+		if math.abs(rel.Position.X) + px > selPlot.Size.X/2 + 1
+			or math.abs(rel.Position.Z) + pz > selPlot.Size.Z/2 + 1 then
+			return
+		end
+	end
+	part.Size = newSize
+	part.CFrame = newCF
+	liveSync()
+end)
+U.resizeHandles.MouseButton1Up:Connect(function()
+	handleGrab = false
+	sizeStart, cfStart = nil, nil
+	if not commitTransform() then restoreSnapshot() end
+end)
+
+local function structStretch(delta)
+	local part = selModel and selModel.PrimaryPart
+	if not part then return end
+	takeSnapshot()
+	local sz = part.Size
+	if selModel.Name == "__Wall" then
+		part.Size = Vector3.new(sz.X, sz.Y, math.max(sz.Z + delta, 2))
+	else -- floors/roofs grow on both ground axes
+		part.Size = Vector3.new(math.max(sz.X + delta, 2), sz.Y, math.max(sz.Z + delta, 2))
+	end
+	if not commitTransform() then restoreSnapshot() end
+end
+
+S.scaleFurniture = function(delta)
+	if not (selModel and not S.isStructure(selModel)) then return end
+	takeSnapshot()
+	local oldBox, oldSize = selModel:GetBoundingBox()
+	local oldBottom = oldBox.Position.Y - oldSize.Y / 2
+	local nextScale = math.clamp(selScale + delta, 0.25, 4)
+	local ok, scaleErr = pcall(function() selModel:ScaleTo(nextScale) end)
+	if not ok then
+		restoreSnapshot()
+		flash("This furniture model cannot be scaled: " .. tostring(scaleErr))
+		return
+	end
+
+	-- Keep floor furniture grounded instead of letting scaling sink it into
+	-- the plot or rise into the air because the model pivot is off-centre.
+	local newBox, newSize = selModel:GetBoundingBox()
+	local newBottom = newBox.Position.Y - newSize.Y / 2
+	local pivot = selModel:GetPivot()
+	selModel:PivotTo(CFrame.new(pivot.Position + Vector3.new(0, oldBottom - newBottom, 0)) * pivot.Rotation)
+	selScale = nextScale
+	if not commitTransform() then
+		restoreSnapshot()
+		pcall(function() selScale = selModel:GetScale() end)
+		flash("The server rejected that scale. Install the v8 server helper transform branch.")
+	end
+end
+
+U.scaleUp.MouseButton1Click:Connect(function()
+	if not selModel then return end
+	if S.isStructure(selModel) then
+		structStretch(moveSnap())
+	else
+		S.scaleFurniture(scaleStep())
+	end
+end)
+U.scaleDown.MouseButton1Click:Connect(function()
+	if not selModel then return end
+	if S.isStructure(selModel) then
+		structStretch(-moveSnap())
+	else
+		S.scaleFurniture(-scaleStep())
+	end
+end)
+
+S.flipSelectedVertical = function()
+	if not selModel then return end
+	takeSnapshot()
+	local pivot = selModel:GetPivot()
+	local target
+	if S.isStructure(selModel) then
+		-- Structures stay usable: Flip swaps the front/back face instead of
+		-- turning a floor or roof upside down. This also swaps wall trim sides.
+		target = CFrame.new(pivot.Position) * CFrame.Angles(0, math.pi, 0) * pivot.Rotation
+	else
+		target = pivot * CFrame.Angles(math.pi, 0, 0)
+	end
+	selModel:PivotTo(clampToPlot(target, selModel))
+	if not commitTransform() then restoreSnapshot() end
+end
+U.selFlip.MouseButton1Click:Connect(S.flipSelectedVertical)
+
+local function rotateSelected(stepDegrees)
+	if not selModel then return end
+	takeSnapshot()
+	local pivot = selModel:GetPivot()
+	local turn = CFrame.Angles(0, math.rad(stepDegrees or rotSnap()), 0)
+	-- Turn around WORLD Y so objects stay upright like Bloxburg furniture.
+	local target = CFrame.new(pivot.Position) * turn * pivot.Rotation
+	selModel:PivotTo(clampToPlot(target, selModel))
+	if not commitTransform() then restoreSnapshot() end
+end
+
+U.selRotate.MouseButton1Click:Connect(rotateSelected)
+selRotateRef = rotateSelected
+-- ⧉ DUPLICATE: start placing another copy of the selected furniture,
+-- matching its rotation and scale (Bloxburg-style copy/paste)
+duplicateSelected = function()
+	if not selModel then return end
+	-- Same behaviour as lasso-copy: clone in place (keeping size,
+	-- rotation and paint), then the copy sticks to the cursor.
+	local source = selModel
+	local pivot = source:GetPivot()
+	local rx, ry, rz = pivot:ToOrientation()
+	local scale = 1
+	pcall(function() scale = source:GetScale() end)
+
+	local ok, copy = buildRemote:InvokeServer({
+		action = "clone", target = source,
+		x = pivot.Position.X, y = pivot.Position.Y, z = pivot.Position.Z,
+		rx = rx, rot = ry, rz = rz, scale = scale,
+	})
+	if not (ok and typeof(copy) == "Instance") then
+		flash(tostring(copy or "Couldn't copy that"))
+		return
+	end
+
+	deselect()
+	setMode("select") -- merged Select tool owns follow-the-cursor placement
+	local h = Instance.new("Highlight")
+	h.FillColor = C.ACCENT
+	h.OutlineColor = C.ACCENT
+	h.FillTransparency = 0.55
+	h.Parent = copy
+	boxSelection[copy] = h
+	U.boxCount.Text = "1 selected"
+	U.boxBar.Visible = true
+	refreshGroupHandlesRef()
+
+	floatingCopies = true
+	groupStartPivots = { [copy] = copy:GetPivot() }
+	groupDragY = copy:GetPivot().Position.Y
+	local unitRay = camera:ScreenPointToRay(mouse.X, mouse.Y)
+	local t = (groupDragY - unitRay.Origin.Y) / unitRay.Direction.Y
+	local grab = unitRay.Origin + unitRay.Direction * t
+	groupDragOrigin = Vector3.new(grab.X, groupDragY, grab.Z)
+	S.groupProxyStart = groupProxy.CFrame
+	flash("Copied - move the mouse, then CLICK to place")
+end
+
+S.stackSelected = function()
+	if not selModel then return end
+	if not S.isStructure(selModel) then
+		flash("Stack Up is for walls, floors, and roofs")
+		return
+	end
+	local source = selModel
+	local plot = plotOfModel(source)
+	local oldLevel = buildLevelOfModel(source, plot)
+	if oldLevel >= MAX_LEVEL then
+		flash("That is already on the top floor")
+		return
+	end
+	local pivot = source:GetPivot()
+	local rx, ry, rz = pivot:ToOrientation()
+	local scale = 1
+	pcall(function() scale = source:GetScale() end)
+	local ok, copy = buildRemote:InvokeServer({
+		action = "clone", target = source, level = oldLevel + 1,
+		x = pivot.Position.X, y = pivot.Position.Y + WALL_HEIGHT, z = pivot.Position.Z,
+		rx = rx, rot = ry, rz = rz, scale = scale, stack = true,
+	})
+	if not (ok and typeof(copy) == "Instance") then
+		flash(tostring(copy or "Couldn't stack that"))
+		return
+	end
+	S.addUndoItem(copy)
+	select(copy)
+	currentLevel = math.clamp(oldLevel + 1, MIN_LEVEL, MAX_LEVEL)
+	for lvl, btn in pairs(U.levelButtons) do
+		btn.BackgroundColor3 = (lvl == currentLevel) and C.ACCENT or C.CARD_BG
+		btn.TextColor3 = (lvl == currentLevel) and C.WHITE or C.TEXT_GRAY
+	end
+	lockBuildPlane(); refreshGridPlane(); refreshLevelView()
+	flash("Stacked one story up")
+end
+U.selStack.MouseButton1Click:Connect(S.stackSelected)
+
+deleteSelected = function()
+	if not selModel then return end
+	local target = selModel
+	deselect()
+	local ok, err = buildRemote:InvokeServer({ action = "remove", target = target })
+	if not ok and err then flash(tostring(err)) end
+end
+
+-- 💥 BULLDOZE: wipe the whole plot (two taps to confirm, owner only)
+local bulldozeArmed = false
+U.bulldozeAction.MouseButton1Click:Connect(function()
+	if not bulldozeArmed then
+		bulldozeArmed = true
+		flash("Tap Clear again to remove the whole plot")
+		U.bulldozeAction.BackgroundColor3 = Color3.fromRGB(255, 225, 225)
+		task.delay(4, function()
+			bulldozeArmed = false
+			U.bulldozeAction.BackgroundColor3 = C.CARD_BG
+		end)
+		return
+	end
+	bulldozeArmed = false
+	U.bulldozeAction.BackgroundColor3 = C.CARD_BG
+	local ok, res = buildRemote:InvokeServer({ action = "bulldoze" })
+	if ok then
+		table.clear(undoStack)
+		flash("Plot cleared (" .. tostring(res) .. " things removed)")
+	else
+		flash(tostring(res or "Couldn't bulldoze"))
+	end
+end)
+
+-- Little confirmation whenever the server autosaves for us
+player:GetAttributeChangedSignal("LastPlotSave"):Connect(function()
+	if U.dock.Visible then
+		flash("Auto-saved")
+	end
+end)
+
+-- Autosave runs by itself; this button is just a manual "save now"
+-- reassurance for players who like pressing buttons.
+-- the shop panel covers the same corner as the wallet, so tuck the wallet
+-- away while shopping (the shop shows your balance anyway)
+setWalletVisible = function(visible)
+	local pg = player:FindFirstChildOfClass("PlayerGui")
+	local w = pg and pg:FindFirstChild("WalletUI")
+	if w and w:IsA("ScreenGui") then w.Enabled = visible end
+end
+
+U.shopAction.MouseButton1Click:Connect(function()
+	if U.shop.Visible then
+		U.shop.Visible = false
+		setWalletVisible(true)
+	else
+		openShopRef()
+		setWalletVisible(false)
+	end
+end)
+
+U.saveAction.MouseButton1Click:Connect(function()
+	local ok, res = buildRemote:InvokeServer({ action = "save" })
+	if ok then
+		flash("Saved " .. tostring(res) .. " objects (autosave is on)")
+	else
+		flash(tostring(res or "Save failed"))
+	end
+end)
+
+U.undoAction.MouseButton1Click:Connect(function() undoLast() end)
+U.copyAction.MouseButton1Click:Connect(function()
+	if boxSelectionCount() > 0 then
+		groupDupeRef()
+	elseif selModel then
+		duplicateSelected()
+	else
+		flash("Select an item or lasso a group first")
+	end
+end)
+U.delAction.MouseButton1Click:Connect(function()
+	if boxSelectionCount() > 0 then
+		groupDeleteRef()
+	elseif selModel then
+		deleteSelected()
+	else
+		setMode("remove")
+		flash("Delete mode: click things to remove them")
+	end
+end)
+
+U.selDup.MouseButton1Click:Connect(duplicateSelected)
+U.selDelete.MouseButton1Click:Connect(deleteSelected)
+U.undoBtn.MouseButton1Click:Connect(function() undoLast() end)
+U.selDone.MouseButton1Click:Connect(deselect)
+
+S.setWallPreviewSegment = function(part, ax, az, bx, bz, planeY)
+	local a = Vector3.new(ax, 0, az)
+	local b = Vector3.new(bx, 0, bz)
+	local length = math.max((b - a).Magnitude, 0.05)
+	local mid = (a + b) / 2 + Vector3.new(0, planeY + WALL_HEIGHT / 2, 0)
+	-- v9.1: preview matches the server's corner sewing (+half thickness per end)
+	part.Size = Vector3.new(0.5, WALL_HEIGHT, length + 0.5)
+	part.CFrame = CFrame.lookAt(mid, Vector3.new(bx, mid.Y, bz))
+	part.Transparency = 0.5
+	part.Color = C.ACCENT
+	return length
+end
+
+S.createPreviewPart = function(parent, name)
+	local part = Instance.new("Part")
+	part.Name = name
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanTouch = false
+	part.CanQuery = false
+	part.CastShadow = false
+	part.Transparency = 0.5
+	part.Color = C.ACCENT
+	part.Material = Enum.Material.SmoothPlastic
+	part.Parent = parent
+	return part
+end
+
+S.updateRoofMarkers = function(x1, z1, x2, z2, y, snappedStart, snappedEnd)
+	local corners = {
+		Vector3.new(x1, y, z1), Vector3.new(x2, y, z1),
+		Vector3.new(x2, y, z2), Vector3.new(x1, y, z2),
+	}
+	local center = Vector3.new((x1 + x2) / 2, y + 0.12, (z1 + z2) / 2)
+
+	local function getPart(index, name, shape, size, colour, transparency)
+		local part = S.roofMarkers[index]
+		if not part then
+			part = Instance.new("Part")
+			part.Name = name
+			part.Anchored = true
+			part.CanCollide = false
+			part.CanTouch = false
+			part.CanQuery = false
+			part.CastShadow = false
+			part.Material = Enum.Material.Neon
+			part.Parent = camera
+			S.roofMarkers[index] = part
+		end
+		part.Shape = shape
+		part.Size = size
+		part.Color = colour
+		part.Transparency = transparency
+		return part
+	end
+
+	-- Every handle is round. Green = anchored/snap start, blue = live end.
+	for i, point in ipairs(corners) do
+		local colour = C.ACCENT
+		if i == 1 then colour = snappedStart and C.GREEN or Color3.fromRGB(86, 220, 150) end
+		if i == 3 then colour = snappedEnd and C.GREEN or Color3.fromRGB(55, 174, 255) end
+		local dot = getPart(i, "RoofSnapDot", Enum.PartType.Ball,
+			Vector3.new(0.82, 0.82, 0.82), colour, 0.04)
+		dot.Position = point
+	end
+
+	local centerDot = getPart(5, "RoofCenter", Enum.PartType.Ball,
+		Vector3.new(0.62, 0.62, 0.62), Color3.fromRGB(235, 245, 255), 0.12)
+	centerDot.Position = center
+
+	local function setLine(index, a, b, colour, thickness)
+		local line = getPart(index, "RoofGuide", Enum.PartType.Block,
+			Vector3.new(thickness, thickness, 1), colour, 0.18)
+		local delta = b - a
+		local length = math.max(delta.Magnitude, 0.05)
+		line.Size = Vector3.new(thickness, thickness, length)
+		if delta.Magnitude < 0.001 then
+			line.CFrame = CFrame.new((a + b) / 2)
+		else
+			line.CFrame = CFrame.lookAt((a + b) / 2, b)
+		end
+	end
+	setLine(6, corners[1], corners[2], Color3.fromRGB(185, 232, 255), 0.11)
+	setLine(7, corners[2], corners[3], Color3.fromRGB(185, 232, 255), 0.11)
+	setLine(8, corners[3], corners[4], Color3.fromRGB(185, 232, 255), 0.11)
+	setLine(9, corners[4], corners[1], Color3.fromRGB(185, 232, 255), 0.11)
+	setLine(10, corners[1] + Vector3.new(0, 0.05, 0), corners[3] + Vector3.new(0, 0.05, 0),
+		Color3.fromRGB(255, 214, 102), 0.08)
+
+	-- A world-space label makes the dimensions and drag direction readable on
+	-- mouse and touch without looking back at the toolbar.
+	local label = centerDot:FindFirstChild("DirectionLabel")
+	if not label then
+		label = Instance.new("BillboardGui")
+		label.Name = "DirectionLabel"
+		label.Size = UDim2.fromOffset(190, 44)
+		label.StudsOffsetWorldSpace = Vector3.new(0, 1.8, 0)
+		label.AlwaysOnTop = true
+		label.Parent = centerDot
+		local text = Instance.new("TextLabel")
+		text.Name = "Text"
+		text.Size = UDim2.fromScale(1, 1)
+		text.BackgroundColor3 = C.PANEL
+		text.BackgroundTransparency = 0.16
+		text.Font = Enum.Font.GothamBold
+		text.TextSize = 14
+		text.TextColor3 = C.TEXT_GRAY
+		text.TextStrokeTransparency = 0.75
+		text.Parent = label
+		corner(text, 10)
+	end
+	local dx, dz = x2 - x1, z2 - z1
+	local xDir = dx >= 0 and "E" or "W"
+	local zDir = dz >= 0 and "S" or "N"
+	local text = label:FindFirstChild("Text")
+	if text then
+		text.Text = string.format("%d × %d studs  •  %s / %s",
+			math.floor(math.abs(dx) + 0.5), math.floor(math.abs(dz) + 0.5), xDir, zDir)
+	end
+end
+
+--------------------------------------------------------------------
+-- PER-FRAME (active only while a tool that needs live previews is up;
+-- every branch early-outs, and hover raycasts never run on touch)
+--------------------------------------------------------------------
+RunService.RenderStepped:Connect(function()
+	if mode == "ghost" and ghost then
+		local hit = mouseHit()
+		if not hit then
+			S.wallAttachTarget = nil
+			-- no surface under the cursor: park the ghost away and block
+			-- placement (this is what caused items floating in the sky)
+			ghost:PivotTo(CFrame.new(0, -10000, 0))
+			colliding = true
+			if ghostHighlight then
+				ghostHighlight.FillColor = C.RED
+				ghostHighlight.OutlineColor = C.RED
+			end
+		elseif ghostWallKind then
+			-- door/window models: snap INTO walls, aligned to the wall
+			local wallModel = climbToPlaced(hit.Instance)
+			if wallModel and wallModel.Name == "__Wall" and wallModel.PrimaryPart then
+				S.wallAttachTarget = wallModel
+				local wallPart = wallModel.PrimaryPart
+				local rel = wallPart.CFrame:PointToObjectSpace(hit.Position)
+				local H = wallPart.Size.Y
+				local wallBottomY = wallPart.Position.Y - H/2
+				local yPos
+				if ghostWallKind == "door" then
+					yPos = wallBottomY + ghostBottomDelta
+				else
+					local maxSill = math.max(0, H - ghostBoxSize.Y)
+					local sill = math.clamp(S.windowSill, 0, maxSill)
+					yPos = wallBottomY + sill + ghostBottomDelta
+				end
+				local inPlane = wallPart.CFrame * CFrame.new(0, 0, math.round(rel.Z))
+				-- must match WALL_ITEM_YAW on the server so the preview
+				-- shows the true final facing
+				local flip = (ghostRotation % (2 * math.pi) >= math.pi) and math.pi or 0
+				ghostWallFlip = flip > 0
+				local cf = CFrame.new(inPlane.Position.X, yPos, inPlane.Position.Z)
+					* wallPart.CFrame.Rotation * CFrame.Angles(0, math.rad(90) + flip, 0)
+				ghost:PivotTo(cf)
+				colliding = false
+				if ghostHighlight then
+					ghostHighlight.FillColor = C.GREEN
+					ghostHighlight.OutlineColor = C.GREEN
+				end
+			else
+				S.wallAttachTarget = nil
+				ghost:PivotTo(CFrame.new(0, -10000, 0))
+				colliding = true
+				if ghostHighlight then
+					ghostHighlight.FillColor = C.RED
+					ghostHighlight.OutlineColor = C.RED
+				end
+			end
+		else
+			local pos = hit.Position
+			local n = hit.Normal
+			local yPos
+			if n.Y > 0.5 then
+				yPos = pos.Y + ghostBottomDelta -- floor: sit on top
+			elseif n.Y < -0.5 then
+				-- ceiling-mounted furniture hangs from the underside
+				yPos = pos.Y - (ghostBoxSize.Y - ghostBottomDelta)
+			else
+				yPos = pos.Y + ghostBottomDelta - ghostBoxSize.Y / 2 -- wall mount: center on hit
+			end
+			local snapped = Vector3.new(
+				math.round(pos.X / GRID) * GRID,
+				yPos,
+				math.round(pos.Z / GRID) * GRID
+			)
+			if math.abs(n.Y) <= 0.5 then
+				-- push off the wall face so it doesn't embed
+				local r = (ghostBoxSize.X + ghostBoxSize.Z) / 4
+				snapped += Vector3.new(n.X, 0, n.Z) * r
+			end
+			local cf = CFrame.new(snapped) * CFrame.Angles(0, ghostRotation, 0)
+			ghost:PivotTo(cf)
+			colliding = false
+			if itemsRoot and ghostBoxOffset then
+				-- furniture-vs-furniture only, and only on this player's plot.
+				local furnitureOnly = {}
+				local activePlot = myPlotPart()
+				for _, plotFolder in ipairs(itemsRoot:GetChildren()) do
+					for _, m in ipairs(plotFolder:GetChildren()) do
+						if m:IsA("Model") and not S.isStructure(m)
+							and plotOfModel(m) == activePlot then
+							table.insert(furnitureOnly, m)
+						end
+					end
+				end
+				if #furnitureOnly > 0 then
+					U.overlapParams.FilterDescendantsInstances = furnitureOnly
+					colliding = #workspace:GetPartBoundsInBox(cf * ghostBoxOffset, ghostBoxSize * 0.85, U.overlapParams) > 0
+				end
+			end
+			if ghostHighlight then
+				ghostHighlight.FillColor = colliding and C.RED or C.GREEN
+				ghostHighlight.OutlineColor = colliding and C.RED or C.GREEN
+			end
+		end
+	elseif UserInputService.TouchEnabled
+		and (mode == "trim" or mode == "remove" or mode == "paint" or mode == "sell") then
+		-- v9: touch has no hover. Skip the per-frame raycasts entirely on
+		-- tablets/phones - tapping still selects via placedHit() in InputBegan.
+		U.hoverHighlight.Parent = nil
+	elseif mode == "trim" then
+		U.hoverHighlight.FillColor = C.ACCENT
+		U.hoverHighlight.OutlineColor = C.ACCENT
+		local hovering = placedHit()
+		if hovering and hovering.Name ~= "__Wall" then hovering = nil end
+		U.hoverHighlight.Parent = hovering
+		if hovering and hovering.PrimaryPart then
+			local _, hoverHit = placedHit()
+			local face = "front"
+			if hoverHit then
+				local toHit = hoverHit.Position - hovering.PrimaryPart.Position
+				face = (toHit:Dot(hovering.PrimaryPart.CFrame.RightVector) >= 0)
+					and "this side" or "far side"
+			end
+			U.header.Text = "TRIM  ·  " .. S.trimStyle .. "  ·  " .. face
+		else
+			U.header.Text = "TRIM  ·  hover the wall face you want trimmed"
+		end
+	elseif mode == "remove" or mode == "paint" or mode == "sell" then
+		U.hoverHighlight.FillColor = (mode == "remove") and C.RED
+			or ((mode == "sell") and C.GOLD or C.ACCENT)
+		if mode == "sell" then
+			local hovering = placedHit()
+			if hovering and not S.isStructure(hovering) then
+				local tmpl = findTemplate(hovering.Name)
+				local p = tmpl and tmpl:GetAttribute("Price")
+				local payout = (type(p) == "number") and math.floor(p * 0.5) or 0
+				U.header.Text = "SELL  ·  " .. hovering.Name .. "  ·  +" .. money(payout)
+			else
+				U.header.Text = "SELL  ·  click an item to sell it"
+			end
+		end
+		U.hoverHighlight.OutlineColor = U.hoverHighlight.FillColor
+		local model = placedHit()
+		if not model then model = placedModelUnderMouse() end
+		-- paint mode highlights everything (furniture is paintable per-part)
+		U.hoverHighlight.Parent = model
+	elseif (mode == "wall" or mode == "floor" or mode == "roof") and structStart then
+		local p = planePoint()
+		if p and structPreview then
+			local cx, cz = snapStruct(p)
+			local roofEndSnapped = false
+			if mode == "roof" then
+				cx, cz, roofEndSnapped = S.snapRoofPoint(cx, cz)
+			end
+			local planeY = buildPlaneY() or structStart.Y
+			if mode == "wall" then
+				local dx, dz = cx - structStart.X, cz - structStart.Z
+				if S.wallMode == "line" then
+					-- Lock line walls to the nearest axis or exact 45-degree diagonal.
+					local adx, adz = math.abs(dx), math.abs(dz)
+					if math.abs(adx - adz) <= WGRID then
+						local d = math.max(adx, adz)
+						cx = structStart.X + (dx >= 0 and d or -d)
+						cz = structStart.Z + (dz >= 0 and d or -d)
+					elseif adx > adz then
+						cz = structStart.Z
+					else
+						cx = structStart.X
+					end
+					-- After the normal axis/45-degree guide, magnetize the endpoint
+					-- to a nearby existing corner or one-stud T-junction.
+					cx, cz = S.snapWallPoint(cx, cz)
+					local length = S.setWallPreviewSegment(structPreview, structStart.X, structStart.Z, cx, cz, planeY)
+					U.header.Text = "WALL  ·  " .. math.floor(length + 0.5) .. " studs"
+				else
+					cx, cz = S.snapWallPoint(cx, cz)
+					local x1, x2 = math.min(structStart.X, cx), math.max(structStart.X, cx)
+					local z1, z2 = math.min(structStart.Z, cz), math.max(structStart.Z, cz)
+					local north = structPreview:FindFirstChild("North")
+					local south = structPreview:FindFirstChild("South")
+					local west = structPreview:FindFirstChild("West")
+					local east = structPreview:FindFirstChild("East")
+					S.setWallPreviewSegment(north, x1, z1, x2, z1, planeY)
+					S.setWallPreviewSegment(south, x1, z2, x2, z2, planeY)
+					S.setWallPreviewSegment(west, x1, z1, x1, z2, planeY)
+					S.setWallPreviewSegment(east, x2, z1, x2, z2, planeY)
+					local sx, sz = math.abs(x2 - x1), math.abs(z2 - z1)
+					U.header.Text = "WALL BOX  ·  " .. math.floor(sx + 0.5) .. " x " .. math.floor(sz + 0.5)
+				end
+				S.structEndX, S.structEndZ = cx, cz
+			else
+				local startX, startZ, endX, endZ = structStart.X, structStart.Z, cx, cz
+				if mode == "roof" then
+					local ox = (cx >= structStart.X) and 1 or -1
+					local oz = (cz >= structStart.Z) and 1 or -1
+					local overhang = S.roofOverhang or 0
+					startX -= ox * overhang
+					startZ -= oz * overhang
+					endX += ox * overhang
+					endZ += oz * overhang
+				end
+				local sx = math.max(math.abs(endX - startX), 0.5)
+				local sz = math.max(math.abs(endZ - startZ), 0.5)
+				-- roofs cap the TOP of the level, floors sit at its base:
+				-- preview at the height the server will actually build
+				local midXp = (startX + endX) / 2
+				local midZp = (startZ + endZ) / 2
+
+				if mode == "roof" and roofShape ~= "flat" and RoofShapes then
+					-- SHAPED ROOF: preview the real geometry, rebuilt as the
+					-- footprint changes, so nothing is a surprise
+					local rise = math.clamp(math.min(sx, sz) * 0.35 * roofPitch, 1, 14)
+					local buildX, buildZ = sx, sz
+					if S.roofRotation % 180 == 90 then buildX, buildZ = sz, sx end
+					local sig = roofShape .. ":" .. math.floor(buildX) .. ":"
+						.. math.floor(buildZ) .. ":" .. roofPitch .. ":" .. S.roofRotation
+					if S.roofGhostSig ~= sig then
+						S.roofGhostSig = sig
+						if S.roofGhost then S.roofGhost:Destroy() end
+						S.roofGhost = buildRoofModel(roofShape, buildX, buildZ, rise, true)
+						if S.roofGhost then S.roofGhost.Parent = camera end
+					end
+					if S.roofGhost then
+						S.roofGhost:PivotTo(CFrame.new(midXp, planeY + WALL_HEIGHT - ROOF_FLOOR_GAP, midZp)
+							* CFrame.Angles(0, math.rad(S.roofRotation), 0))
+					end
+					S.updateRoofMarkers(startX, startZ, endX, endZ, planeY + WALL_HEIGHT + 0.35,
+						S.roofStartSnapped, roofEndSnapped)
+					-- Keep a translucent footprint beneath the real roof geometry so the
+					-- player can see exactly which grid cells will be covered.
+					structPreview.Transparency = 0.74
+					structPreview.Material = Enum.Material.ForceField
+					structPreview.Color = Color3.fromRGB(55, 174, 255)
+					structPreview.Size = Vector3.new(sx, 0.12, sz)
+					structPreview.CFrame = CFrame.new(midXp, planeY + WALL_HEIGHT + 0.06, midZp)
+				else
+					if S.roofGhost then S.roofGhost:Destroy() S.roofGhost = nil S.roofGhostSig = nil end
+					structPreview.Transparency = 0.5
+					local previewY = (mode == "roof")
+						and (planeY + WALL_HEIGHT + 0.3)
+						or (planeY + 0.25)
+					structPreview.Size = Vector3.new(sx, (mode == "roof") and 0.6 or 0.4, sz)
+					structPreview.CFrame = CFrame.new(midXp, previewY, midZp)
+					if mode == "roof" then
+						S.updateRoofMarkers(startX, startZ, endX, endZ, planeY + WALL_HEIGHT + 0.35,
+							S.roofStartSnapped, roofEndSnapped)
+					end
+				end
+				S.structEndX, S.structEndZ = cx, cz
+				local dims = math.floor(sx + 0.5) .. " x " .. math.floor(sz + 0.5)
+				U.header.Text = (mode == "roof")
+					and (roofShape:upper() .. " ROOF  ·  " .. dims)
+					or ("FLOOR  ·  " .. dims)
+				-- same-kind overlap preview (floors vs floors, roofs vs roofs)
+				local wanted = (mode == "roof") and "__Roof" or "__Floor"
+				local includes = {}
+				if itemsRoot then
+					for _, plotFolder in ipairs(itemsRoot:GetChildren()) do
+						for _, m in ipairs(plotFolder:GetChildren()) do
+							if m:IsA("Model") and m.Name == wanted then
+								table.insert(includes, m)
+							end
+						end
+					end
+				end
+				local bad = false
+				if #includes > 0 and (mode ~= "roof" or roofShape == "flat") then
+					U.overlapParams.FilterDescendantsInstances = includes
+					local checkSize = Vector3.new(math.max(sx - 0.4, 0.1), 2, math.max(sz - 0.4, 0.1))
+					bad = #workspace:GetPartBoundsInBox(structPreview.CFrame, checkSize, U.overlapParams) > 0
+				end
+				structPreview.Color = bad and C.RED or C.ACCENT
+			end
+		end
+	end
+end)
+
+--------------------------------------------------------------------
+-- TRIM PANEL: interior mouldings and exterior boards. Trim belongs to
+-- the wall, so doors cut through it and restored walls keep it.
+--------------------------------------------------------------------
+do -- scoped: keeps the trim panel's locals out of the main pool
+	--------------------------------------------------------------------
+	-- TRIM PANEL: interior mouldings and exterior boards. Trim belongs to
+	-- the wall, so doors cut through it and restored walls keep it.
+	--------------------------------------------------------------------
+	S.trimStyle = "baseboard"
+
+	local TRIM_STYLES = {
+		{ id = "none",      label = "None",       group = "" },
+		-- v9.1 TWO-SIDED WALLS: a full-height skin for ONE face, with its own
+		-- material + colour from the Paint pill. Interior and exterior can
+		-- differ; only dual-painted walls pay for the extra thin part.
+		{ id = "face",      label = "Wall skin",  group = "TWO-SIDED WALLS" },
+		{ id = "brickbase", label = "Brick base",  group = "BASES" },
+		{ id = "stonebase", label = "Stone base",  group = "BASES" },
+		{ id = "slatebase", label = "Slate base",  group = "BASES" },
+		{ id = "fullbrick", label = "Full brick",  group = "BASES" },
+		{ id = "baseboard", label = "Baseboard",  group = "INTERIOR" },
+		{ id = "crown",     label = "Crown",      group = "INTERIOR" },
+		{ id = "both",      label = "Base+Crown", group = "INTERIOR" },
+		{ id = "panel",     label = "Wainscot",   group = "INTERIOR" },
+		{ id = "band",      label = "Belt course", group = "EXTERIOR" },
+		{ id = "timber",    label = "Timber",     group = "EXTERIOR" },
+	}
+
+	-- v9.1: a ScrollingFrame, so on short screens the style list scrolls
+	-- inside a clamped panel instead of overflowing past the screen edge.
+	U.trimPanel = Instance.new("ScrollingFrame")
+	U.trimPanel.Size = UDim2.fromOffset(180, 590)
+	U.trimPanel.AnchorPoint = Vector2.new(1, 1)
+	U.trimPanel.Position = UDim2.new(1, -14, 1, -262)
+	U.trimPanel.BackgroundColor3 = C.PANEL
+	U.trimPanel.BackgroundTransparency = 0.05
+	U.trimPanel.BorderSizePixel = 0
+	U.trimPanel.ScrollBarThickness = 4
+	U.trimPanel.ScrollingDirection = Enum.ScrollingDirection.Y
+	U.trimPanel.CanvasSize = UDim2.new()
+	U.trimPanel.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	U.trimPanel.Visible = false
+	U.trimPanel.Parent = U.gui
+	corner(U.trimPanel, 12); stroke(U.trimPanel)
+
+	local trimTitle = Instance.new("TextLabel")
+	trimTitle.Size = UDim2.new(1, 0, 0, 24)
+	trimTitle.BackgroundTransparency = 1
+	trimTitle.Font = Enum.Font.GothamBold
+	trimTitle.TextSize = 12
+	trimTitle.TextColor3 = C.TEXT_GRAY
+	trimTitle.Text = "WALL TRIM"
+	trimTitle.Parent = U.trimPanel
+
+	local trimButtons = {}
+	local function refreshTrim()
+		for id, b in pairs(trimButtons) do
+			local on = (id == S.trimStyle)
+			b.BackgroundColor3 = on and C.ACCENT or C.CARD_BG
+			b.TextColor3 = on and C.WHITE or C.TEXT_GRAY
+		end
+	end
+
+	local ty = 26
+	local lastGroup = nil
+	for _, def in ipairs(TRIM_STYLES) do
+		if def.group ~= "" and def.group ~= lastGroup then
+			lastGroup = def.group
+			local hdr = Instance.new("TextLabel")
+			hdr.Size = UDim2.fromOffset(160, 16)
+			hdr.Position = UDim2.fromOffset(10, ty)
+			hdr.BackgroundTransparency = 1
+			hdr.Font = Enum.Font.GothamBold
+			hdr.TextSize = 10
+			hdr.TextColor3 = Color3.fromRGB(140, 148, 162)
+			hdr.TextXAlignment = Enum.TextXAlignment.Left
+			hdr.Text = def.group
+			hdr.Parent = U.trimPanel
+			ty += 18
+		end
+
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.fromOffset(160, 30)
+		b.Position = UDim2.fromOffset(10, ty)
+		b.BackgroundColor3 = C.CARD_BG
+		b.Font = Enum.Font.GothamBold
+		b.TextSize = 12
+		b.TextColor3 = C.TEXT_GRAY
+		b.Text = def.label
+		b.Parent = U.trimPanel
+		corner(b, 8)
+		trimButtons[def.id] = b
+		b.MouseButton1Click:Connect(function()
+			S.trimStyle = def.id
+			refreshTrim()
+		end)
+		ty += 34
+	end
+
+	-- TRIM STYLING: trim uses the Paint pill's material, colour and
+	-- transparency - so the eyedropper works on it like anything else.
+	-- These swatches are just quick colour picks.
+	S.trimColor = Color3.fromRGB(248, 248, 244)
+
+	local colHdr = Instance.new("TextLabel")
+	colHdr.Size = UDim2.fromOffset(160, 16)
+	colHdr.Position = UDim2.fromOffset(10, ty + 2)
+	colHdr.BackgroundTransparency = 1
+	colHdr.Font = Enum.Font.GothamBold
+	colHdr.TextSize = 10
+	colHdr.TextColor3 = Color3.fromRGB(140, 148, 162)
+	colHdr.TextXAlignment = Enum.TextXAlignment.Left
+	colHdr.Text = "QUICK COLOURS"
+	colHdr.Parent = U.trimPanel
+	ty += 20
+
+	local trimSwatches = {}
+	local TRIM_COLORS = {
+		Color3.fromRGB(248, 248, 244), Color3.fromRGB(226, 220, 205),
+		Color3.fromRGB(190, 182, 170), Color3.fromRGB(120, 126, 136),
+		Color3.fromRGB(58, 62, 70),    Color3.fromRGB(28, 30, 34),
+		Color3.fromRGB(196, 168, 130), Color3.fromRGB(150, 108, 70),
+		Color3.fromRGB(98, 66, 44),    Color3.fromRGB(120, 150, 190),
+		Color3.fromRGB(120, 170, 130), Color3.fromRGB(190, 130, 130),
+	}
+	for i, col in ipairs(TRIM_COLORS) do
+		local sw = Instance.new("TextButton")
+		sw.Size = UDim2.fromOffset(24, 20)
+		sw.Position = UDim2.fromOffset(10 + ((i - 1) % 6) * 27, ty + math.floor((i - 1) / 6) * 24)
+		sw.BackgroundColor3 = col
+		sw.Text = ""
+		sw.Parent = U.trimPanel
+		corner(sw, 5)
+		trimSwatches[i] = sw
+		sw.MouseButton1Click:Connect(function()
+			S.trimColor = col
+			selectedColor = col -- keep the Paint pill in step
+			if pillSwatchRef then pillSwatchRef(col) end
+			for _, other in ipairs(trimSwatches) do
+				local st = other:FindFirstChildOfClass("UIStroke")
+				if st then st:Destroy() end
+			end
+			local st = Instance.new("UIStroke")
+			st.Thickness = 2
+			st.Color = C.ACCENT
+			st.Parent = sw
+		end)
+	end
+	ty += 52
+
+	local trimHint = Instance.new("TextLabel")
+	trimHint.Size = UDim2.new(1, -16, 0, 46)
+	trimHint.Position = UDim2.fromOffset(8, ty + 2)
+	trimHint.BackgroundTransparency = 1
+	trimHint.Font = Enum.Font.Gotham
+	trimHint.TextSize = 10
+	trimHint.TextWrapped = true
+	trimHint.TextColor3 = Color3.fromRGB(140, 148, 162)
+	trimHint.Text = "Trim keeps its own material and colour. Use the eyedropper on either the wall or trim, then click the exact face/part."
+	trimHint.Parent = U.trimPanel
+
+	refreshTrim()
+end
+
+--------------------------------------------------------------------
+-- WALL PANEL: Bloxburg-style line or rectangular box placement.
+--------------------------------------------------------------------
+do
+	U.wallPanel = Instance.new("Frame")
+	U.wallPanel.Size = UDim2.fromOffset(180, 104)
+	U.wallPanel.AnchorPoint = Vector2.new(1, 1)
+	U.wallPanel.Position = UDim2.new(1, -14, 1, -262)
+	U.wallPanel.BackgroundColor3 = C.PANEL
+	U.wallPanel.BackgroundTransparency = 0.05
+	U.wallPanel.Visible = false
+	U.wallPanel.Parent = U.gui
+	corner(U.wallPanel, 12); stroke(U.wallPanel)
+
+	local wallTitle = Instance.new("TextLabel")
+	wallTitle.Size = UDim2.new(1, 0, 0, 24)
+	wallTitle.BackgroundTransparency = 1
+	wallTitle.Font = Enum.Font.GothamBold
+	wallTitle.TextSize = 12
+	wallTitle.TextColor3 = C.TEXT_GRAY
+	wallTitle.Text = "WALL PLACEMENT"
+	wallTitle.Parent = U.wallPanel
+
+	local wallModeButtons = {}
+	local function refreshWallMode()
+		for id, button in pairs(wallModeButtons) do
+			local active = id == S.wallMode
+			button.BackgroundColor3 = active and C.ACCENT or C.CARD_BG
+			button.TextColor3 = active and C.WHITE or C.TEXT_GRAY
+		end
+	end
+	for i, def in ipairs({
+		{ id = "line", label = "Line" },
+		{ id = "box", label = "Box" },
+		}) do
+		local button = Instance.new("TextButton")
+		button.Size = UDim2.fromOffset(78, 30)
+		button.Position = UDim2.fromOffset(10 + (i - 1) * 82, 28)
+		button.BackgroundColor3 = C.CARD_BG
+		button.Font = Enum.Font.GothamBold
+		button.TextSize = 12
+		button.TextColor3 = C.TEXT_GRAY
+		button.Text = def.label
+		button.Parent = U.wallPanel
+		corner(button, 8)
+		wallModeButtons[def.id] = button
+		button.MouseButton1Click:Connect(function()
+			S.wallMode = def.id
+			clearStructure()
+			refreshWallMode()
+			flash(def.label .. " wall placement")
+		end)
+	end
+	refreshWallMode()
+
+	local wallHint = Instance.new("TextLabel")
+	wallHint.Size = UDim2.new(1, -16, 0, 34)
+	wallHint.Position = UDim2.fromOffset(8, 64)
+	wallHint.BackgroundTransparency = 1
+	wallHint.Font = Enum.Font.Gotham
+	wallHint.TextSize = 10
+	wallHint.TextWrapped = true
+	wallHint.TextColor3 = Color3.fromRGB(140, 148, 162)
+	wallHint.Text = "Press, drag, and release. Box draws all four sides on the 1-stud grid."
+	wallHint.Parent = U.wallPanel
+end
+
+--------------------------------------------------------------------
+-- ITEM SHOP: buy furniture into your inventory, then place it for free
+-- from the Inventory tab. Stock comes from the same ReplicatedStorage
+-- Furniture folder - drop a model in, set a "Price" attribute, done.
+--------------------------------------------------------------------
+do -- scoped: keeps the shop's helpers out of the main register pool
+	U.shop = Instance.new("Frame")
+	U.shop.Size = UDim2.fromOffset(760, 460)
+	U.shop.AnchorPoint = Vector2.new(0.5, 0.5)
+	U.shop.Position = UDim2.fromScale(0.5, 0.46)
+	U.shop.BackgroundColor3 = C.PANEL
+	U.shop.Visible = false
+	U.shop.Parent = U.gui
+	corner(U.shop, 14); stroke(U.shop)
+
+	local shopTitle = Instance.new("TextLabel")
+	shopTitle.Size = UDim2.new(1, -240, 0, 46)
+	shopTitle.Position = UDim2.fromOffset(20, 4)
+	shopTitle.BackgroundTransparency = 1
+	shopTitle.Font = Enum.Font.FredokaOne
+	shopTitle.TextSize = 20
+	shopTitle.TextColor3 = C.TEXT_GRAY
+	shopTitle.TextXAlignment = Enum.TextXAlignment.Left
+	shopTitle.Text = "FURNITURE SHOP"
+	shopTitle.Parent = U.shop
+
+	U.shopBalance = Instance.new("TextLabel")
+	U.shopBalance.Size = UDim2.fromOffset(150, 30)
+	U.shopBalance.Position = UDim2.new(1, -212, 0, 12)
+	U.shopBalance.BackgroundColor3 = C.CARD_BG
+	U.shopBalance.Font = Enum.Font.GothamBold
+	U.shopBalance.TextSize = 14
+	U.shopBalance.TextColor3 = C.GOLD
+	U.shopBalance.Text = "--"
+	U.shopBalance.Parent = U.shop
+	corner(U.shopBalance, 8)
+
+	local shopClose = Instance.new("TextButton")
+	shopClose.Size = UDim2.fromOffset(34, 34)
+	shopClose.Position = UDim2.new(1, -46, 0, 10)
+	shopClose.BackgroundColor3 = C.RED
+	shopClose.Font = Enum.Font.GothamBold
+	shopClose.TextSize = 18
+	shopClose.TextColor3 = C.WHITE
+	shopClose.Text = "X"
+	shopClose.Parent = U.shop
+	corner(shopClose, 17)
+
+	U.shopSearch = Instance.new("TextBox")
+	U.shopSearch.Size = UDim2.fromOffset(240, 30)
+	U.shopSearch.Position = UDim2.fromOffset(20, 48)
+	U.shopSearch.BackgroundColor3 = C.CARD_BG
+	U.shopSearch.Font = Enum.Font.Gotham
+	U.shopSearch.TextSize = 13
+	U.shopSearch.TextColor3 = C.TEXT_GRAY
+	U.shopSearch.PlaceholderText = "Search furniture..."
+	U.shopSearch.PlaceholderColor3 = Color3.fromRGB(140, 148, 162)
+	U.shopSearch.Text = ""
+	U.shopSearch.ClearTextOnFocus = false
+	U.shopSearch.Parent = U.shop
+	corner(U.shopSearch, 8)
+
+	U.shopSide = Instance.new("ScrollingFrame")
+	U.shopSide.Size = UDim2.fromOffset(150, 366)
+	U.shopSide.Position = UDim2.fromOffset(20, 86)
+	U.shopSide.BackgroundTransparency = 1
+	U.shopSide.ScrollBarThickness = 4
+	U.shopSide.CanvasSize = UDim2.new()
+	U.shopSide.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	U.shopSide.Parent = U.shop
+	local shopSideList = Instance.new("UIListLayout")
+	shopSideList.Padding = UDim.new(0, 6)
+	shopSideList.SortOrder = Enum.SortOrder.LayoutOrder
+	shopSideList.Parent = U.shopSide
+
+	U.shopGrid = Instance.new("ScrollingFrame")
+	U.shopGrid.Size = UDim2.fromOffset(558, 366)
+	U.shopGrid.Position = UDim2.fromOffset(184, 86)
+	U.shopGrid.BackgroundTransparency = 1
+	U.shopGrid.ScrollBarThickness = 6
+	U.shopGrid.CanvasSize = UDim2.new()
+	U.shopGrid.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	U.shopGrid.Parent = U.shop
+	local shopLayout = Instance.new("UIGridLayout")
+	shopLayout.CellSize = UDim2.fromOffset(150, 190)
+	shopLayout.CellPadding = UDim2.fromOffset(10, 10)
+	shopLayout.Parent = U.shopGrid
+
+	S.shopStock, S.shopCategory, S.shopOwned = {}, "All", {}
+
+	-- The standalone WalletUI publishes the authoritative display balance on
+	-- player.Wallet. Prefer that value over a stale shop response so both UIs
+	-- always show the same number.
+	local function currentWalletBalance(fallback)
+		local attr = player:GetAttribute("Wallet")
+		if type(attr) == "number" then return attr end
+		if type(S.balance) == "number" then return S.balance end
+		if type(fallback) == "number" then return fallback end
+		return nil
+	end
+
+	local function refreshShopBalance(fallback)
+		local value = currentWalletBalance(fallback)
+		U.shopBalance.Text = (type(value) == "number") and money(value) or "balance unavailable"
+	end
+
+	player:GetAttributeChangedSignal("Wallet"):Connect(function()
+		local value = player:GetAttribute("Wallet")
+		if type(value) == "number" then S.balance = value end
+		if U.shop.Visible then refreshShopBalance() end
+	end)
+
+	local function renderShop()
+		for _, ch in ipairs(U.shopGrid:GetChildren()) do
+			if ch:IsA("Frame") then ch:Destroy() end
+		end
+		local query = U.shopSearch.Text:lower()
+		local shown = 0
+		for _, item in ipairs(S.shopStock) do
+			local matchCat = (S.shopCategory == "All") or (item.category == S.shopCategory)
+			local matchText = (query == "") or (item.name:lower():find(query, 1, true) ~= nil)
+			if matchCat and matchText then
+				shown += 1
+				local card = Instance.new("Frame")
+				card.BackgroundColor3 = C.CARD_BG
+				card.Parent = U.shopGrid
+				corner(card, 10)
+
+				local template = findTemplate(item.name)
+				if template then makeThumbnailRef(template, card) end
+
+				local nm = Instance.new("TextLabel")
+				nm.Size = UDim2.new(1, -12, 0, 30)
+				nm.Position = UDim2.fromOffset(6, 126)
+				nm.BackgroundTransparency = 1
+				nm.Font = Enum.Font.GothamBold
+				nm.TextSize = 12
+				nm.TextWrapped = true
+				nm.TextColor3 = C.TEXT_GRAY
+				nm.Text = item.name
+				nm.Parent = card
+
+				local owned = S.shopOwned[item.name]
+				if owned and owned > 0 then
+					local badge = Instance.new("TextLabel")
+					badge.Size = UDim2.fromOffset(38, 18)
+					badge.Position = UDim2.fromOffset(8, 8)
+					badge.BackgroundColor3 = C.ACCENT
+					badge.Font = Enum.Font.GothamBold
+					badge.TextSize = 10
+					badge.TextColor3 = C.WHITE
+					badge.Text = "x" .. owned
+					badge.ZIndex = 3
+					badge.Parent = card
+					corner(badge, 9)
+				end
+
+				local buy = Instance.new("TextButton")
+				buy.Size = UDim2.new(1, -12, 0, 30)
+				buy.Position = UDim2.new(0, 6, 1, -36)
+				buy.BackgroundColor3 = (item.price > 0) and C.GOLD or C.GREEN
+				buy.Font = Enum.Font.GothamBold
+				buy.TextSize = 13
+				buy.TextColor3 = C.WHITE
+				buy.Text = (item.price > 0) and money(item.price) or "Free"
+				buy.Parent = card
+				corner(buy, 8)
+
+				buy.MouseButton1Click:Connect(function()
+					local label = buy.Text
+					buy.Text = "..."
+					local ok, res = buildRemote:InvokeServer({ action = "buy", item = item.name, qty = 1 })
+					if ok and type(res) == "table" then
+						S.shopOwned[item.name] = res.owned
+						if type(res.balance) == "number" then S.balance = res.balance end
+						refreshShopBalance(res.balance)
+						flash("Bought " .. item.name)
+						renderShopRef()
+					else
+						buy.Text = tostring(res or "Failed")
+						task.delay(1.6, function() buy.Text = label end)
+					end
+				end)
+			end
+		end
+		if shown == 0 then
+			local none = Instance.new("Frame")
+			none.BackgroundTransparency = 1
+			none.Parent = U.shopGrid
+			local l = Instance.new("TextLabel")
+			l.Size = UDim2.fromScale(1, 1)
+			l.BackgroundTransparency = 1
+			l.Font = Enum.Font.Gotham
+			l.TextSize = 13
+			l.TextWrapped = true
+			l.TextColor3 = C.TEXT_GRAY
+			l.Text = "Nothing here. Add models to ReplicatedStorage > Furniture."
+			l.Parent = none
+		end
+	end
+
+	local function buildShopSidebar()
+		for _, ch in ipairs(U.shopSide:GetChildren()) do
+			if ch:IsA("TextButton") then ch:Destroy() end
+		end
+		local cats, seen = { "All" }, { All = true }
+		for _, item in ipairs(S.shopStock) do
+			if not seen[item.category] then
+				seen[item.category] = true
+				table.insert(cats, item.category)
+			end
+		end
+		for i, name in ipairs(cats) do
+			local b = Instance.new("TextButton")
+			b.Size = UDim2.new(1, 0, 0, 32)
+			b.LayoutOrder = i
+			b.BackgroundColor3 = (name == S.shopCategory) and C.ACCENT or C.CARD_BG
+			b.Font = Enum.Font.GothamBold
+			b.TextSize = 13
+			b.TextColor3 = (name == S.shopCategory) and C.WHITE or C.TEXT_GRAY
+			b.Text = name
+			b.Parent = U.shopSide
+			corner(b, 8)
+			b.MouseButton1Click:Connect(function()
+				S.shopCategory = name
+				buildShopSidebarRef()
+				renderShopRef()
+			end)
+		end
+	end
+
+	local function openShop()
+		local callOK, ok, data = pcall(function()
+			return buildRemote:InvokeServer({ action = "shop" })
+		end)
+		if not callOK then
+			setWalletVisible(true)
+			flash("Shop connection error: " .. tostring(ok))
+			return
+		end
+		if not (ok and type(data) == "table") then
+			setWalletVisible(true)
+			flash(tostring(data or "Shop unavailable"))
+			return
+		end
+		S.shopStock = data.items or {}
+		S.shopOwned = data.owned or {}
+		if type(data.balance) == "number" then S.balance = data.balance end
+		refreshShopBalance(data.balance)
+		buildShopSidebar()
+		renderShop()
+		U.shop.Visible = true
+	end
+
+	renderShopRef = renderShop
+	buildShopSidebarRef = buildShopSidebar
+	openShopRef = openShop
+
+	shopClose.MouseButton1Click:Connect(function()
+		U.shop.Visible = false
+		local pg = player:FindFirstChildOfClass("PlayerGui")
+		local w = pg and pg:FindFirstChild("WalletUI")
+		if w then w.Enabled = true end
+	end)
+	U.shopSearch:GetPropertyChangedSignal("Text"):Connect(function() renderShopRef() end)
+end
+
+
+--------------------------------------------------------------------
+-- ROOF TRACING: drop points on wall corners (like editing vertices) and
+-- the roof is generated over the outline you draw.
+--------------------------------------------------------------------
+S.tracePoints = {}     -- Vector3 outline, in order
+S.traceDots = {}       -- the visible markers
+S.traceGhost = nil     -- live roof preview over the outline
+S.snapDots = {}        -- candidate corners harvested from your walls
+
+local function clearTrace()
+	for _, d in ipairs(S.traceDots) do d:Destroy() end
+	for _, d in ipairs(S.snapDots) do d:Destroy() end
+	table.clear(S.traceDots)
+	table.clear(S.snapDots)
+	table.clear(S.tracePoints)
+	if S.traceGhost then S.traceGhost:Destroy() S.traceGhost = nil end
+	U.traceBar.Visible = false
+end
+
+local function marker(pos, colour, size)
+	local p = Instance.new("Part")
+	p.Shape = Enum.PartType.Ball
+	p.Size = Vector3.one * (size or 1.1)
+	p.Position = pos
+	p.Anchored = true
+	p.CanCollide = false
+	p.CanQuery = false
+	p.Material = Enum.Material.Neon
+	p.Color = colour
+	p.Parent = camera
+	return p
+end
+
+-- collect the ends of every wall on this level: those are the corners
+-- you'll usually want to trace around
+local function harvestCorners()
+	for _, d in ipairs(S.snapDots) do d:Destroy() end
+	table.clear(S.snapDots)
+	if not itemsRoot then return end
+	local planeY = buildPlaneY()
+	if not planeY then return end
+	local seen = {}
+	for _, plotFolder in ipairs(itemsRoot:GetChildren()) do
+		for _, m in ipairs(plotFolder:GetChildren()) do
+			if m:IsA("Model") and m.Name == "__Wall" and m.PrimaryPart
+				and plotOfModel(m) == (S.activePlot or myPlotPart()) then
+				local part = m.PrimaryPart
+				-- only walls belonging to this storey
+				if math.abs((part.Position.Y - part.Size.Y / 2) - planeY) < 1.5 then
+					for _, dir in ipairs({ 1, -1 }) do
+						local p = (part.CFrame * CFrame.new(0, -part.Size.Y / 2, dir * part.Size.Z / 2)).Position
+						local key = math.floor(p.X + 0.5) .. "," .. math.floor(p.Z + 0.5)
+						if not seen[key] then
+							seen[key] = true
+							table.insert(S.snapDots, marker(Vector3.new(p.X, planeY + WALL_HEIGHT, p.Z),
+								Color3.fromRGB(255, 214, 102), 0.9))
+						end
+					end
+				end
+			end
+		end
+	end
+end
+
+local function refreshTraceGhost()
+	if S.traceGhost then S.traceGhost:Destroy() S.traceGhost = nil end
+	if #S.tracePoints < 3 or not RoofShapes then return end
+	local planeY = buildPlaneY()
+	if not planeY then return end
+
+	local minX, maxX = math.huge, -math.huge
+	local minZ, maxZ = math.huge, -math.huge
+	for _, p in ipairs(S.tracePoints) do
+		minX, maxX = math.min(minX, p.X), math.max(maxX, p.X)
+		minZ, maxZ = math.min(minZ, p.Z), math.max(maxZ, p.Z)
+	end
+	local span = math.min(maxX - minX, maxZ - minZ)
+	if span < 2 then return end
+	local rise = math.clamp(span * 0.35 * roofPitch, 1, 14)
+
+	local pieces = RoofShapes.BuildPolygon(S.tracePoints, planeY + WALL_HEIGHT, rise,
+		(roofShape == "flat") and "flat" or "hip")
+	if #pieces == 0 then return end
+	local model = Instance.new("Model")
+	for _, piece in ipairs(pieces) do
+		local p = Instance.new(piece.wedge and "WedgePart" or "Part")
+		p.Size = piece.size
+		p.CFrame = piece.cf
+		p.Anchored = true
+		p.CanCollide = false
+		p.CanQuery = false
+		p.Material = Enum.Material.SmoothPlastic
+		p.Color = C.ACCENT
+		p.Transparency = 0.45
+		p.Parent = model
+	end
+	model.Parent = camera
+	S.traceGhost = model
+end
+
+local function addTracePoint()
+	local p = planePoint()
+	if not p then flash("Stand on your plot to trace") return end
+	local planeY = buildPlaneY()
+
+	-- snap to the nearest harvested corner if we're close to one
+	local best, bestDist = nil, 6
+	for _, dot in ipairs(S.snapDots) do
+		local d = (Vector3.new(dot.Position.X, 0, dot.Position.Z) - Vector3.new(p.X, 0, p.Z)).Magnitude
+		if d < bestDist then best, bestDist = dot, d end
+	end
+	local point
+	if best then
+		point = Vector3.new(best.Position.X, 0, best.Position.Z)
+	else
+		local sx, sz = snapStruct(p)
+		point = Vector3.new(sx, 0, sz)
+	end
+
+	-- clicking the first dot again closes the loop and builds
+	if #S.tracePoints >= 3 then
+		local first = S.tracePoints[1]
+		if (Vector3.new(first.X, 0, first.Z) - point).Magnitude < 3 then
+			S.buildTracedRoofRef()
+			return
+		end
+	end
+
+	table.insert(S.tracePoints, point)
+	table.insert(S.traceDots, marker(Vector3.new(point.X, (planeY or 0) + WALL_HEIGHT, point.Z), C.ACCENT, 1.2))
+	U.traceBar.Visible = true
+	U.traceCount.Text = #S.tracePoints .. " points"
+	refreshTraceGhost()
+end
+
+buildTracedRoof = function()
+	if #S.tracePoints < 3 then flash("Need at least 3 points") return end
+	local pts = {}
+	for _, p in ipairs(S.tracePoints) do
+		table.insert(pts, { x = p.X, z = p.Z })
+	end
+	local ok, err = buildRemote:InvokeServer({
+		action = "roofpoly", points = pts, level = currentLevel,
+		pitch = roofPitch, shape = roofShape,
+		roofRotation = S.roofRotation, roofSnap = S.roofSnap,
+		overhang = S.roofOverhang, verticalOffset = -ROOF_FLOOR_GAP,
+		mat = selectedMaterial, t = selectedTransparency,
+		r = selectedColor.R, g = selectedColor.G, b = selectedColor.B,
+	})
+	if ok then
+		flash("Roof built from " .. #pts .. " points")
+		clearTrace()
+		harvestCorners()
+		task.defer(refreshLevelView)
+	else
+		flash(tostring(err or "Couldn't build that roof"))
+	end
+end
+
+S.buildAutoRoofRef = function()
+	if not itemsRoot then return end
+	local planeY = buildPlaneY()
+	if not planeY then flash("Stand on your plot first") return end
+
+	local minX, maxX = math.huge, -math.huge
+	local minZ, maxZ = math.huge, -math.huge
+	local walls = 0
+	for _, plotFolder in ipairs(itemsRoot:GetChildren()) do
+		for _, model in ipairs(plotFolder:GetChildren()) do
+			if model:IsA("Model") and model.Name == "__Wall" and model.PrimaryPart
+				and plotOfModel(model) == (S.activePlot or myPlotPart()) then
+				local part = model.PrimaryPart
+				if math.abs((part.Position.Y - part.Size.Y / 2) - planeY) < 1.5 then
+					walls += 1
+					local cf, size = model:GetBoundingBox()
+					local half = size / 2
+					for _, sx in ipairs({ -1, 1 }) do
+						for _, sz in ipairs({ -1, 1 }) do
+							local point = cf:PointToWorldSpace(Vector3.new(half.X * sx, 0, half.Z * sz))
+							minX, maxX = math.min(minX, point.X), math.max(maxX, point.X)
+							minZ, maxZ = math.min(minZ, point.Z), math.max(maxZ, point.Z)
+						end
+					end
+				end
+			end
+		end
+	end
+
+	if walls == 0 or minX == math.huge then
+		flash("Auto Roof needs walls on this level")
+		return
+	end
+	local overhang = S.roofOverhang or 1
+	local ok, result = buildRemote:InvokeServer({
+		action = "roof", level = currentLevel,
+		-- Raw wall bounds; the server adds Edge once.
+		ax = minX, az = minZ,
+		bx = maxX, bz = maxZ,
+		shape = roofShape, pitch = roofPitch,
+		roofRotation = S.roofRotation, roofSnap = S.roofSnap,
+		overhang = overhang, verticalOffset = -ROOF_FLOOR_GAP,
+		mat = selectedMaterial, t = selectedTransparency,
+		r = selectedColor.R, g = selectedColor.G, b = selectedColor.B,
+	})
+	if ok then
+		if typeof(result) == "Instance" then
+			table.insert(undoStack, result)
+		end
+		flash("Auto roof built over " .. walls .. " walls")
+		task.defer(refreshLevelView)
+	else
+		flash(tostring(result or "Auto roof failed"))
+	end
+end
+
+S.clearTraceRef = clearTrace
+S.harvestCornersRef = harvestCorners
+
+U.traceBuild.MouseButton1Click:Connect(function() S.buildTracedRoofRef() end)
+U.traceUndo.MouseButton1Click:Connect(function()
+	if #S.tracePoints == 0 then return end
+	local last = table.remove(S.tracePoints)
+	local dot = table.remove(S.traceDots)
+	if dot then dot:Destroy() end
+	U.traceCount.Text = #S.tracePoints .. " points"
+	U.traceBar.Visible = #S.tracePoints > 0
+	refreshTraceGhost()
+end)
+
+--------------------------------------------------------------------
+-- LASSO SELECTION (part of the merged Select tool)
+--------------------------------------------------------------------
+U.boxFrame = Instance.new("Frame")
+U.boxFrame.BackgroundColor3 = C.ACCENT
+U.boxFrame.BackgroundTransparency = 0.7
+U.boxFrame.BorderSizePixel = 0
+U.boxFrame.Visible = false
+U.boxFrame.Parent = U.gui
+U.boxStroke = Instance.new("UIStroke")
+U.boxStroke.Color = C.ACCENT
+U.boxStroke.Thickness = 2
+U.boxStroke.Parent = U.boxFrame
+
+U.boxBar = Instance.new("Frame")
+U.boxBar.Size = UDim2.fromOffset(676, 52)
+U.boxBar.AnchorPoint = Vector2.new(0.5, 1)
+U.boxBar.Position = UDim2.new(0.5, 0, 1, -262)
+U.boxBar.BackgroundColor3 = C.PANEL
+U.boxBar.Visible = false
+U.boxBar.Parent = U.gui
+corner(U.boxBar, 12); stroke(U.boxBar)
+
+U.boxCount = Instance.new("TextLabel")
+U.boxCount.Size = UDim2.fromOffset(94, 52)
+U.boxCount.Position = UDim2.fromOffset(10, 0)
+U.boxCount.BackgroundTransparency = 1
+U.boxCount.Font = Enum.Font.GothamBold
+U.boxCount.TextSize = 12
+U.boxCount.TextColor3 = C.TEXT_GRAY
+U.boxCount.TextXAlignment = Enum.TextXAlignment.Left
+U.boxCount.Text = "0 selected"
+U.boxCount.TextWrapped = true
+U.boxCount.Parent = U.boxBar
+
+local function boxBtn(text, x, w, col, fg)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(w, 38)
+	b.Position = UDim2.fromOffset(x, 7)
+	b.BackgroundColor3 = col
+	b.Font = Enum.Font.FredokaOne
+	b.TextSize = 11
+	b.TextColor3 = fg or C.WHITE
+	b.Text = text
+	b.Parent = U.boxBar
+	corner(b, 8)
+	return b
+end
+
+U.boxRotate = boxBtn("Turn", 104, 66, C.CARD_BG, C.TEXT_GRAY)
+U.boxFlip = boxBtn("Flip", 174, 62, C.CARD_BG, C.TEXT_GRAY)
+U.boxDupe = boxBtn("Copy", 240, 66, C.CARD_BG, C.TEXT_GRAY)
+U.boxStack = boxBtn("Stack Up", 310, 82, C.CARD_BG, C.GOLD)
+U.boxStamp = boxBtn("Repeat", 396, 72, C.CARD_BG, C.TEXT_GRAY)
+U.boxStamp.MouseButton1Click:Connect(function() S.toggleStamp() end)
+U.refreshStampButton()
+U.boxDelete = boxBtn("Delete", 472, 76, C.RED, C.WHITE)
+U.boxClear = boxBtn("Done", 552, 114, C.GREEN, C.WHITE)
+
+local refreshGroupHandles -- forward (defined just below)
+
+local function clearBoxSelection()
+	for _, h in pairs(boxSelection) do
+		if h then h:Destroy() end
+	end
+	table.clear(boxSelection)
+	U.boxBar.Visible = false
+	U.boxCount.Text = "0 selected"
+	groupHandles = false
+	groupDragActive = false
+	groupStartPivots = nil
+	floatingCopies = false
+	S.boxPressModel = nil
+	if U.moveHandles.Adornee == groupProxy then
+		U.moveHandles.Adornee = nil
+		U.arcHandles.Adornee = nil
+		U.resizeHandles.Adornee = nil
+	end
+end
+
+boxSelectionCount = function()
+	local n = 0
+	for _ in pairs(boxSelection) do n += 1 end
+	return n
+end
+
+U.modelOverlapsScreenRect = function(model, minX, minY, maxX, maxY)
+	local cf, size = model:GetBoundingBox()
+	local half = size / 2
+	local sxMin, syMin = math.huge, math.huge
+	local sxMax, syMax = -math.huge, -math.huge
+	local hasPointInFront = false
+
+	for _, x in ipairs({ -1, 1 }) do
+		for _, y in ipairs({ -1, 1 }) do
+			for _, z in ipairs({ -1, 1 }) do
+				local world = cf:PointToWorldSpace(Vector3.new(half.X * x, half.Y * y, half.Z * z))
+				local screen = camera:WorldToViewportPoint(world)
+				if screen.Z > 0 then
+					hasPointInFront = true
+					sxMin = math.min(sxMin, screen.X)
+					syMin = math.min(syMin, screen.Y)
+					sxMax = math.max(sxMax, screen.X)
+					syMax = math.max(syMax, screen.Y)
+				end
+			end
+		end
+	end
+
+	return hasPointInFront
+		and sxMax >= minX and sxMin <= maxX
+		and syMax >= minY and syMin <= maxY
+end
+
+local function gatherInBox(p1, p2)
+	deselect()
+	clearBoxSelection()
+	if not itemsRoot then return end
+	local minX, maxX = math.min(p1.X, p2.X), math.max(p1.X, p2.X)
+	local minY, maxY = math.min(p1.Y, p2.Y), math.max(p1.Y, p2.Y)
+	local activePlot = myPlotPart()
+
+	for _, plotFolder in ipairs(itemsRoot:GetChildren()) do
+		for _, model in ipairs(plotFolder:GetChildren()) do
+			if model:IsA("Model") and plotOfModel(model) == activePlot
+				and U.modelOverlapsScreenRect(model, minX, minY, maxX, maxY) then
+				local h = Instance.new("Highlight")
+				h.FillColor = C.ACCENT
+				h.OutlineColor = C.ACCENT
+				h.FillTransparency = 0.55
+				h.Parent = model
+				boxSelection[model] = h
+			end
+		end
+	end
+
+	local n = boxSelectionCount()
+	U.boxCount.Text = n .. " selected"
+	U.boxBar.Visible = n > 0
+	if n == 0 then flash("Nothing inside that box") end
+	refreshGroupHandles()
+end
+
+-- Send one item's new CFrame to the server (structures use resize)
+local function sendItemTransform(model)
+	local pivot = model:GetPivot()
+	local rx, ry, rz = pivot:ToOrientation()
+	if S.isStructure(model) then
+		local part = model.PrimaryPart
+		if not part then return true end
+		local prx, pry, prz = part.CFrame:ToOrientation()
+		return buildRemote:InvokeServer({
+			action = "resize", target = model,
+			sx = part.Size.X, sy = part.Size.Y, sz = part.Size.Z,
+			x = part.Position.X, y = part.Position.Y, z = part.Position.Z,
+			rot = pry, rx = prx, rz = prz,
+		})
+	end
+	local scale = 1
+	pcall(function() scale = model:GetScale() end)
+	return buildRemote:InvokeServer({
+		action = "transform", target = model,
+		x = pivot.Position.X, y = pivot.Position.Y, z = pivot.Position.Z,
+		rot = ry, rx = rx, rz = rz, scale = scale,
+	})
+end
+
+local function boxCenter()
+	local sum, n = Vector3.zero, 0
+	for model in pairs(boxSelection) do
+		sum += model:GetPivot().Position
+		n += 1
+	end
+	return (n > 0) and (sum / n) or Vector3.zero
+end
+
+-- park the invisible proxy at the selection's centre and adorn handles
+refreshGroupHandles = function()
+	local n = boxSelectionCount()
+	if n == 0 then
+		groupHandles = false
+		if U.moveHandles.Adornee == groupProxy then
+			U.moveHandles.Adornee = nil
+			U.arcHandles.Adornee = nil
+		end
+		return
+	end
+	-- fit the invisible proxy around the whole cluster: the handles then
+	-- sit OUTSIDE the items, where you can actually grab them
+	local minV, maxV
+	for model in pairs(boxSelection) do
+		local cf, size = model:GetBoundingBox()
+		local half = size / 2
+		local lo, hi = cf.Position - half, cf.Position + half
+		minV = minV and Vector3.new(math.min(minV.X, lo.X), math.min(minV.Y, lo.Y), math.min(minV.Z, lo.Z)) or lo
+		maxV = maxV and Vector3.new(math.max(maxV.X, hi.X), math.max(maxV.Y, hi.Y), math.max(maxV.Z, hi.Z)) or hi
+	end
+	local size = (maxV - minV)
+	groupProxy.Size = Vector3.new(math.max(size.X, 2), math.max(size.Y, 2), math.max(size.Z, 2))
+	groupProxy.CFrame = CFrame.new((minV + maxV) / 2)
+	S.copyCellX = math.max(GRID, math.floor(size.X / GRID + 0.5) * GRID)
+	S.copyCellZ = math.max(GRID, math.floor(size.Z / GRID + 0.5) * GRID)
+	groupHandles = true
+	U.selBox.Adornee = nil
+	U.moveHandles.Adornee = groupProxy
+	U.arcHandles.Axes = Axes.new(Enum.Axis.X, Enum.Axis.Y, Enum.Axis.Z)
+	U.arcHandles.Adornee = groupProxy
+	U.resizeHandles.Adornee = nil
+end
+
+local function commitGroup(startPivots)
+	local failed = 0
+	for model in pairs(boxSelection) do
+		if model.Parent and not sendItemTransform(model) then
+			failed += 1
+			-- put rejected pieces back where they were so the client and
+			-- server agree (otherwise they snap back on rejoin)
+			if startPivots and startPivots[model] then
+				model:PivotTo(startPivots[model])
+			end
+		end
+	end
+	if failed > 0 then
+		flash(failed .. " piece(s) wouldn't fit on the plot - moved back")
+	end
+end
+
+-- ⟲ rotate the whole selection about its centre
+local function groupRotate(stepDegrees)
+	if boxSelectionCount() == 0 then return end
+	local center = boxCenter()
+	local turn = CFrame.Angles(0, math.rad(stepDegrees or rotSnap()), 0)
+	for model in pairs(boxSelection) do
+		local pivot = model:GetPivot()
+		local offset = pivot.Position - center
+		local rotated = center + (turn * offset)
+		model:PivotTo(CFrame.new(rotated) * (turn * pivot.Rotation))
+	end
+
+	if floatingCopies or groupDragActive then
+		-- Keep rotated copies/dragged groups attached to the cursor after pressing R.
+		refreshGroupHandles()
+		groupStartPivots = {}
+		for model in pairs(boxSelection) do
+			groupStartPivots[model] = model:GetPivot()
+		end
+		S.groupProxyStart = groupProxy.CFrame
+		local unitRay = camera:ScreenPointToRay(mouse.X, mouse.Y)
+		if math.abs(unitRay.Direction.Y) > 1e-4 then
+			local t = (groupDragY - unitRay.Origin.Y) / unitRay.Direction.Y
+			if t > 0 then
+				local grab = unitRay.Origin + unitRay.Direction * t
+				groupDragOrigin = Vector3.new(grab.X, groupDragY, grab.Z)
+			end
+		end
+	else
+		commitGroup()
+		refreshGroupHandles()
+	end
+end
+
+U.boxRotate.MouseButton1Click:Connect(groupRotate)
+groupRotateRef = groupRotate
+
+S.groupFlipVertical = function()
+	if boxSelectionCount() == 0 then return end
+	local starts = {}
+	for model in pairs(boxSelection) do
+		starts[model] = model:GetPivot()
+		local pivot = model:GetPivot()
+		if S.isStructure(model) then
+			model:PivotTo(CFrame.new(pivot.Position) * CFrame.Angles(0, math.pi, 0) * pivot.Rotation)
+		else
+			model:PivotTo(pivot * CFrame.Angles(math.pi, 0, 0))
+		end
+	end
+	commitGroup(starts)
+	refreshGroupHandles()
+end
+U.boxFlip.MouseButton1Click:Connect(S.groupFlipVertical)
+
+-- ⧉ duplicate the whole selection, offset to one side
+local function groupDupe()
+	local n = boxSelectionCount()
+	if n == 0 then return end
+	-- copies land EXACTLY on top of the originals; you then drag the
+	-- (auto-selected) copies out to where you want them
+	local copies, failed = {}, 0
+	for model in pairs(boxSelection) do
+		if model.Parent then
+			-- send the source's CURRENT transform so a copy of a copy
+			-- lands on that copy, not back on the original
+			local pivot = model:GetPivot()
+			local rx, ry, rz = pivot:ToOrientation()
+			local mscale = 1
+			pcall(function() mscale = model:GetScale() end)
+			local ok, res = buildRemote:InvokeServer({
+				action = "clone", target = model,
+				x = pivot.Position.X, y = pivot.Position.Y, z = pivot.Position.Z,
+				rx = rx, rot = ry, rz = rz, scale = mscale,
+			})
+			if ok and typeof(res) == "Instance" then
+				table.insert(copies, res)
+			else
+				failed += 1
+			end
+		end
+	end
+
+	clearBoxSelection()
+	-- select the new copies so they can be dragged straight into place
+	for _, copy in ipairs(copies) do
+		local h = Instance.new("Highlight")
+		h.FillColor = C.ACCENT
+		h.OutlineColor = C.ACCENT
+		h.FillTransparency = 0.55
+		h.Parent = copy
+		boxSelection[copy] = h
+	end
+	U.boxCount.Text = #copies .. " selected"
+	U.boxBar.Visible = #copies > 0
+	refreshGroupHandles()
+
+	-- pick the copies up immediately: they follow the mouse until you click
+	if #copies > 0 then
+		floatingCopies = true
+		groupStartPivots = {}
+		for _, copy in ipairs(copies) do
+			groupStartPivots[copy] = copy:GetPivot()
+		end
+		groupDragY = copies[1]:GetPivot().Position.Y
+		local unitRay = camera:ScreenPointToRay(mouse.X, mouse.Y)
+		local t = (groupDragY - unitRay.Origin.Y) / unitRay.Direction.Y
+		local grab = unitRay.Origin + unitRay.Direction * t
+		groupDragOrigin = Vector3.new(grab.X, groupDragY, grab.Z)
+		S.groupProxyStart = groupProxy.CFrame
+	end
+	flash("Copied " .. #copies .. " - move the mouse, then CLICK to place")
+end
+
+U.boxDupe.MouseButton1Click:Connect(groupDupe)
+groupDupeRef = groupDupe
+
+S.stackGroup = function()
+	if boxSelectionCount() == 0 then return end
+	local copies, skipped = {}, 0
+	for model in pairs(boxSelection) do
+		if model.Parent and S.isStructure(model) then
+			local oldLevel = buildLevelOfModel(model, plotOfModel(model))
+			if oldLevel < MAX_LEVEL then
+				local pivot = model:GetPivot()
+				local rx, ry, rz = pivot:ToOrientation()
+				local scale = 1
+				pcall(function() scale = model:GetScale() end)
+				local ok, copy = buildRemote:InvokeServer({
+					action = "clone", target = model, level = oldLevel + 1, stack = true,
+					x = pivot.Position.X, y = pivot.Position.Y + WALL_HEIGHT, z = pivot.Position.Z,
+					rx = rx, rot = ry, rz = rz, scale = scale,
+				})
+				if ok and typeof(copy) == "Instance" then
+					table.insert(copies, copy); S.addUndoItem(copy)
+				else skipped += 1 end
+			else skipped += 1 end
+		else skipped += 1 end
+	end
+	clearBoxSelection()
+	for _, copy in ipairs(copies) do
+		local h = Instance.new("Highlight")
+		h.FillColor = C.ACCENT; h.OutlineColor = C.ACCENT; h.FillTransparency = 0.55
+		h.Parent = copy; boxSelection[copy] = h
+	end
+	U.boxCount.Text = #copies .. " selected"
+	U.boxBar.Visible = #copies > 0
+	refreshGroupHandles(); refreshLevelView()
+	flash("Stacked " .. #copies .. " piece(s)" .. (skipped > 0 and (" • skipped " .. skipped) or ""))
+end
+U.boxStack.MouseButton1Click:Connect(S.stackGroup)
+
+S.dropFloatingCopies = function(continueStamp)
+	if not (floatingCopies and groupStartPivots) or S.stampBusy then return end
+	S.stampBusy = true
+	floatingCopies = false
+	local starts = groupStartPivots
+	groupStartPivots = nil
+	commitGroupRef(starts)
+	refreshGroupHandlesRef()
+	S.lastStampCenter = groupProxy.Position
+
+	if continueStamp and S.stampMode and boxSelectionCount() > 0 then
+		-- Clone the objects that were just placed, so repeated stamps preserve
+		-- every rotation, scale, material and trim exactly.
+		groupDupeRef()
+	else
+		flash("Placed!")
+	end
+	S.stampBusy = false
+end
+
+local function groupDelete()
+	local removed, failed = 0, 0
+	for model in pairs(boxSelection) do
+		if model.Parent then
+			local ok = buildRemote:InvokeServer({ action = "remove", target = model })
+			if ok then removed += 1 else failed += 1 end
+		end
+	end
+	clearBoxSelection()
+	flash("Removed " .. removed .. (failed > 0 and (" (" .. failed .. " blocked)") or ""))
+end
+
+U.boxDelete.MouseButton1Click:Connect(groupDelete)
+groupDeleteRef = groupDelete
+U.boxClear.MouseButton1Click:Connect(clearBoxSelection)
+clearBoxSelectionRef = clearBoxSelection
+commitGroupRef = commitGroup
+refreshGroupHandlesRef = refreshGroupHandles
+
+--------------------------------------------------------------------
+-- CLICK ACTIONS
+--------------------------------------------------------------------
+local function tryPlace()
+	if not (ghost and selectedItem) then return end
+	if colliding then flash("Too close to another item!") return end
+	local pivot = ghost:GetPivot()
+	local _, pivotYaw, _ = pivot:ToEulerAnglesYXZ()
+	local ok, err = buildRemote:InvokeServer({
+		action = "place", item = selectedItem, source = selectedSource,
+		x = pivot.Position.X, y = pivot.Position.Y, z = pivot.Position.Z,
+		rot = ghostWallKind and pivotYaw or ghostRotation,
+		flip = ghostWallKind and ghostWallFlip or nil,
+		wallKind = ghostWallKind, wallTarget = S.wallAttachTarget,
+		sill = (ghostWallKind == "window") and S.windowSill or nil,
+	})
+	if not ok and err then flash(tostring(err)) end
+	if ok and typeof(err) == "Instance" then
+		table.insert(undoStack, err) -- second return value is the placed model
+		if #undoStack > 40 then table.remove(undoStack, 1) end
+		task.defer(refreshLevelView)
+	end
+end
+
+undoLast = function()
+	while #undoStack > 0 do
+		local item = table.remove(undoStack)
+		if item and item.Parent then
+			local okU = buildRemote:InvokeServer({ action = "remove", target = item })
+			flash(okU and "Undid last placement" or "Couldn't undo that")
+			return
+		end
+	end
+	flash("Nothing to undo")
+end
+
+S.addUndoItem = function(item)
+	if typeof(item) ~= "Instance" then return end
+	table.insert(undoStack, item)
+	if #undoStack > 40 then table.remove(undoStack, 1) end
+end
+
+S.sendStructureSegment = function(action, ax, az, bx, bz)
+	local ok, result = buildRemote:InvokeServer({
+		action = action, level = currentLevel,
+		ax = ax, az = az, bx = bx, bz = bz,
+		mat = selectedMaterial, t = selectedTransparency,
+		r = selectedColor.R, g = selectedColor.G, b = selectedColor.B,
+		shape = (action == "roof") and roofShape or nil,
+		pitch = (action == "roof") and roofPitch or nil,
+		roofRotation = (action == "roof") and S.roofRotation or nil,
+		roofSnap = (action == "roof") and S.roofSnap or nil,
+		overhang = (action == "roof") and S.roofOverhang or nil,
+		verticalOffset = (action == "roof") and -ROOF_FLOOR_GAP or nil,
+		height = (action == "wall") and WALL_HEIGHT or nil,
+		thickness = (action == "wall") and 0.5 or nil,
+	})
+	if not ok then
+		flash(tostring(result or "Build rejected"))
+		return false
+	end
+	S.addUndoItem(result)
+	if action == "wall" and S.WallSnap and S.activePlot then
+		S.WallSnap.Invalidate(S.activePlot)
+	end
+	task.defer(refreshLevelView)
+	return true
+end
+
+S.beginStructureDrag = function()
+	local p = planePoint()
+	if not p then flash("Stand on your plot to build!") return end
+	clearStructure()
+	local cx, cz = snapStruct(p)
+	S.roofStartSnapped = false
+	if mode == "wall" then
+		cx, cz = S.snapWallPoint(cx, cz)
+	elseif mode == "roof" then
+		cx, cz, S.roofStartSnapped = S.snapRoofPoint(cx, cz)
+	end
+	structStart = Vector3.new(cx, p.Y, cz)
+	S.structEndX, S.structEndZ = cx, cz
+	S.structDragging = true
+
+	if mode == "wall" and S.wallMode == "box" then
+		structPreview = Instance.new("Model")
+		structPreview.Name = "WallBoxPreview"
+		structPreview.Parent = camera
+		S.createPreviewPart(structPreview, "North")
+		S.createPreviewPart(structPreview, "South")
+		S.createPreviewPart(structPreview, "West")
+		S.createPreviewPart(structPreview, "East")
+	else
+		structPreview = S.createPreviewPart(camera, "StructurePreview")
+	end
+end
+
+S.commitStructureDrag = function()
+	if not (S.structDragging and structStart) then return end
+	S.structDragging = false
+	local cx, cz = S.structEndX or structStart.X, S.structEndZ or structStart.Z
+
+	if mode == "wall" then
+		if S.wallMode == "box" then
+			local x1, x2 = math.min(structStart.X, cx), math.max(structStart.X, cx)
+			local z1, z2 = math.min(structStart.Z, cz), math.max(structStart.Z, cz)
+			if math.abs(x2 - x1) < 0.5 or math.abs(z2 - z1) < 0.5 then
+				flash("Drag a wider box")
+			else
+				S.sendStructureSegment("wall", x1, z1, x2, z1)
+				S.sendStructureSegment("wall", x2, z1, x2, z2)
+				S.sendStructureSegment("wall", x2, z2, x1, z2)
+				S.sendStructureSegment("wall", x1, z2, x1, z1)
+			end
+		else
+			local length = (Vector2.new(cx, cz) - Vector2.new(structStart.X, structStart.Z)).Magnitude
+			if length >= 0.5 then
+				S.sendStructureSegment("wall", structStart.X, structStart.Z, cx, cz)
+			else
+				flash("Drag to set the wall length")
+			end
+		end
+	elseif mode == "floor" then
+		if math.abs(cx - structStart.X) >= 0.5 and math.abs(cz - structStart.Z) >= 0.5 then
+			S.sendStructureSegment("floor", structStart.X, structStart.Z, cx, cz)
+		else
+			flash("Drag a floor rectangle")
+		end
+	elseif mode == "roof" then
+		if math.abs(cx - structStart.X) >= 0.5 and math.abs(cz - structStart.Z) >= 0.5 then
+			-- Send the snapped WALL/GRID footprint. The server applies Edge exactly
+			-- once. Older clients expanded here and the server expanded again,
+			-- making the saved roof larger than the preview.
+			S.sendStructureSegment("roof", structStart.X, structStart.Z, cx, cz)
+		else
+			flash("Drag a roof rectangle")
+		end
+	end
+	clearStructure()
+end
+
+UserInputService.InputBegan:Connect(function(input, processed)
+	if processed then return end
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+		if mode == "ghost" then
+			-- On touch, a tap MOVES the ghost; the ✔ button places it.
+			-- (Otherwise taps placed at the ghost's previous spot.)
+			if input.UserInputType ~= Enum.UserInputType.Touch then
+				tryPlace()
+			end
+		elseif mode == "trim" then
+			local model, hit = placedHit()
+			-- eyedropper active? sample whatever was clicked (trim included)
+			if eyedropper and hit and hit.Instance:IsA("BasePart") then
+				selectedMaterial = hit.Instance.Material.Name
+				selectedColor = hit.Instance.Color
+				selectedTransparency = hit.Instance.Transparency
+				U.pillSwatch.BackgroundColor3 = selectedColor
+				U.pillSwatch.BackgroundTransparency = selectedTransparency
+				eyedropper = false
+				if eyeBtn then eyeBtn.BackgroundColor3 = C.CARD_BG end
+				flash("Style copied - now click a wall face")
+				return
+			end
+			if model and model.Name == "__Wall" and model.PrimaryPart then
+				-- work out WHICH FACE was clicked, so trim lands on the side
+				-- you're looking at (inside vs outside)
+				local side = 1
+				if hit then
+					local toHit = hit.Position - model.PrimaryPart.Position
+					side = (toHit:Dot(model.PrimaryPart.CFrame.RightVector) >= 0) and 1 or -1
+				end
+				-- uses whatever the Paint pill is holding, so the 💧 eyedropper
+				-- samples a material/colour and the trim takes it too
+				local ok, err = buildRemote:InvokeServer({
+					action = "trim", target = model, style = S.trimStyle, side = side,
+					mat = selectedMaterial, t = selectedTransparency,
+					r = selectedColor.R, g = selectedColor.G, b = selectedColor.B,
+					tagTrim = true, preserveWallStyle = true,
+				})
+				if not ok and err then flash(tostring(err)) end
+			else
+				flash("Trim goes on walls")
+			end
+		elseif mode == "sell" then
+			local model = placedHit()
+			if not model then model = placedModelUnderMouse() end
+			if model then
+				local ok, refund = buildRemote:InvokeServer({ action = "sellplaced", target = model })
+				if ok then
+					flash("Sold for " .. money(refund or 0))
+				else
+					flash(tostring(refund or "Can't sell that"))
+				end
+				U.hoverHighlight.Parent = nil
+			end
+		elseif mode == "remove" then
+			local model = placedModelUnderMouse()
+			if model then
+				buildRemote:InvokeServer({ action = "remove", target = model })
+				U.hoverHighlight.Parent = nil
+			end
+		elseif mode == "paint" then
+			local model, hit = placedHit()
+			if not model then model = placedModelUnderMouse() end
+			if model and eyedropper then
+				-- copy from the EXACT part clicked - works on meshes too
+				local part = (hit and hit.Instance) or model.PrimaryPart
+				if part and part:IsA("BasePart") then
+					selectedMaterial = part.Material.Name
+					selectedColor = part.Color
+					selectedTransparency = part.Transparency
+					U.pillSwatch.BackgroundColor3 = selectedColor
+					U.pillSwatch.BackgroundTransparency = selectedTransparency
+					eyedropper = false
+					if eyeBtn then eyeBtn.BackgroundColor3 = C.CARD_BG end
+					flash("Style copied!")
+				end
+			elseif model then
+				local part = (hit and hit.Instance) or model.PrimaryPart
+				buildRemote:InvokeServer({
+					action = "paint", target = model, part = part,
+					paintScope = "part", preserveTrim = true,
+					mat = selectedMaterial,
+					r = selectedColor.R, g = selectedColor.G, b = selectedColor.B,
+					t = selectedTransparency,
+				})
+			end
+		elseif mode == "select" then
+			-- A copied item/group follows the cursor until this click drops it.
+			if floatingCopies then
+				S.stampHeld = S.stampMode
+				S.dropFloatingCopies(S.stampMode)
+				return
+			end
+
+			-- Never steal a click that belongs to a Studio handle.
+			if handleGrab or dragStart or rotStart or sizeStart then return end
+
+			local hitModel = placedHit()
+			if not hitModel then hitModel = placedModelUnderMouse() end
+
+			-- Clicking any member of a lasso selection drags the whole group.
+			if hitModel and boxSelection[hitModel] then
+				groupDragActive = true
+				groupDragY = hitModel:GetPivot().Position.Y
+				local unitRay = camera:ScreenPointToRay(mouse.X, mouse.Y)
+				local t = (groupDragY - unitRay.Origin.Y) / unitRay.Direction.Y
+				local grab = unitRay.Origin + unitRay.Direction * t
+				groupDragOrigin = Vector3.new(grab.X, groupDragY, grab.Z)
+				groupStartPivots = {}
+				for model in pairs(boxSelection) do
+					groupStartPivots[model] = model:GetPivot()
+				end
+				S.groupProxyStart = groupProxy.CFrame
+				return
+			end
+
+			if hitModel == selModel and selModel then
+				local pivot = selModel:GetPivot()
+				dragSelPending = true
+				dragSelStart = input.Position
+				dragSelY = pivot.Position.Y
+				local unitRay = camera:ScreenPointToRay(mouse.X, mouse.Y)
+				local t = (dragSelY - unitRay.Origin.Y) / unitRay.Direction.Y
+				local grab = unitRay.Origin + unitRay.Direction * t
+				dragSelOffset = Vector3.new(pivot.Position.X - grab.X, 0, pivot.Position.Z - grab.Z)
+			elseif hitModel then
+				select(hitModel)
+				flash("Selected: " .. hitModel.Name:gsub("__", ""))
+			else
+				-- Empty-space drag starts lasso; empty click clears on release.
+				dragSelPending = false
+				S.boxPressModel = nil
+				boxDragStart = Vector2.new(input.Position.X, input.Position.Y)
+				U.boxFrame.Position = UDim2.fromOffset(boxDragStart.X, boxDragStart.Y)
+				U.boxFrame.Size = UDim2.fromOffset(0, 0)
+				U.boxFrame.Visible = true
+			end
+		elseif mode == "roof" and S.roofMode == "trace" then
+			addTracePoint()
+		elseif mode == "roof" and S.roofMode == "auto" then
+			S.buildAutoRoofRef()
+		elseif mode == "wall" or mode == "floor" or mode == "roof" then
+			S.beginStructureDrag()
+		end
+	elseif input.KeyCode == Enum.KeyCode.R then
+		-- Bloxburg-style quick turn: plain R rotates the active build object.
+		if mode == "ghost" then
+			ghostRotation += ghostWallKind and math.pi or math.rad(90)
+		elseif mode == "roof" then
+			S.roofRotation = (S.roofRotation + 90) % 180
+			S.roofGhostSig = nil
+			flash("Roof turned " .. S.roofRotation .. "°")
+		elseif mode == "select" then
+			if boxSelectionCount() > 0 then
+				groupRotateRef(90)
+			elseif selModel then
+				selRotateRef(90)
+			end
+		end
+	elseif input.KeyCode == Enum.KeyCode.C and mode == "select" then
+		S.toggleStamp()
+	elseif input.KeyCode == Enum.KeyCode.Delete or input.KeyCode == Enum.KeyCode.X then
+		if boxSelectionCount() > 0 then
+			groupDeleteRef()
+		elseif mode == "select" and selModel then
+			deleteSelected()
+		end
+	elseif input.KeyCode == Enum.KeyCode.D and mode == "select"
+		and (UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)
+			or UserInputService:IsKeyDown(Enum.KeyCode.RightControl)) then
+		-- v9 FIX: copy is Ctrl+D now. Bare D is the WASD strafe key, so
+		-- walking right with a wall/floor selected silently cloned it in
+		-- place - that was the "duplicates every 3-5 seconds" bug.
+		-- Mobile players use the Copy button instead.
+		if boxSelectionCount() > 0 then
+			groupDupeRef()
+		elseif selModel then
+			duplicateSelected()
+		end
+	elseif input.KeyCode == Enum.KeyCode.T then
+		local ctrl = UserInputService:IsKeyDown(Enum.KeyCode.LeftControl)
+			or UserInputService:IsKeyDown(Enum.KeyCode.RightControl)
+		if ctrl then
+			setMode("select")
+			flash("Select: click one item or drag empty space to lasso")
+		elseif mode == "select" then
+			if boxSelectionCount() > 0 then
+				S.groupFlipVertical()
+			elseif selModel then
+				S.flipSelectedVertical()
+			end
+		end
+	elseif input.KeyCode == Enum.KeyCode.Z
+		and UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
+		if U.dock.Visible then undoLast() end
+	elseif input.KeyCode == Enum.KeyCode.Escape then
+		-- first Escape puts the tool down, a second one leaves build mode
+		if mode ~= nil then
+			setMode(nil)
+		elseif U.shop.Visible then
+			U.shop.Visible = false
+		elseif U.dock.Visible then
+			closeBuildModeRef()
+		end
+	end
+end)
+
+-- Touch-only Place button (desktop places by clicking)
+U.placeBtn = Instance.new("TextButton")
+U.placeBtn.Size = UDim2.fromOffset(72, 44)
+U.placeBtn.AnchorPoint = Vector2.new(0.5, 1)
+U.placeBtn.Position = UDim2.new(0.5, -126, 1, -262)
+U.placeBtn.BackgroundColor3 = C.GREEN
+U.placeBtn.TextColor3 = C.WHITE
+U.placeBtn.Text = "Place"
+U.placeBtn.Font = Enum.Font.FredokaOne
+U.placeBtn.TextSize = 12
+U.placeBtn.Visible = false
+U.placeBtn.Parent = U.gui
+corner(U.placeBtn, 12); stroke(U.placeBtn)
+U.placeBtn.MouseButton1Click:Connect(tryPlace)
+
+-- v9: quick-action tinting only WRITES when the state actually changes,
+-- and the whole check sleeps while the dock is closed.
+RunService.RenderStepped:Connect(function()
+	if not U.dock.Visible then return end
+	local wantPlace = (mode == "ghost") and UserInputService.TouchEnabled
+	if U.placeBtn.Visible ~= wantPlace then U.placeBtn.Visible = wantPlace end
+	local wantWindow = (mode == "ghost" and ghostWallKind == "window")
+	if U.windowBar.Visible ~= wantWindow then U.windowBar.Visible = wantWindow end
+	-- Copy needs a selection; show that clearly instead of failing silently
+	local hasSel = selModel ~= nil or boxSelectionCount() > 0
+	if S.uiHasSel ~= hasSel then
+		S.uiHasSel = hasSel
+		U.copyActionLabel.TextColor3 = hasSel and C.ACCENT or Color3.fromRGB(150, 158, 172)
+		U.copyAction.BackgroundColor3 = hasSel and Color3.fromRGB(224, 238, 255) or C.CARD_BG
+	end
+	local canUndo = #undoStack > 0
+	if S.uiCanUndo ~= canUndo then
+		S.uiCanUndo = canUndo
+		U.undoActionLabel.TextColor3 = canUndo and C.ACCENT or Color3.fromRGB(150, 158, 172)
+	end
+end)
+
+-- Selected-item dragging (shared by mouse move + touch move)
+UserInputService.InputChanged:Connect(function(input)
+	if input.UserInputType ~= Enum.UserInputType.MouseMovement
+		and input.UserInputType ~= Enum.UserInputType.Touch then return end
+	if floatingCopies and groupStartPivots then
+		local unitRay = camera:ScreenPointToRay(mouse.X, mouse.Y)
+		if math.abs(unitRay.Direction.Y) > 1e-4 then
+			local t = (groupDragY - unitRay.Origin.Y) / unitRay.Direction.Y
+			if t > 0 then
+				local p = unitRay.Origin + unitRay.Direction * t
+				local snapX = S.stampMode and S.copyCellX or moveSnap()
+				local snapZ = S.stampMode and S.copyCellZ or moveSnap()
+				local delta = Vector3.new(
+					math.round((p.X - groupDragOrigin.X) / snapX) * snapX, 0,
+					math.round((p.Z - groupDragOrigin.Z) / snapZ) * snapZ
+				)
+				for model, startPivot in pairs(groupStartPivots) do
+					if typeof(model) == "Instance" and model.Parent then
+						model:PivotTo(startPivot + delta)
+					end
+				end
+				groupProxy.CFrame = CFrame.new(S.groupProxyStart.Position + delta)
+				if S.stampHeld and S.stampMode and not S.stampBusy then
+					local movedFromLast = not S.lastStampCenter
+						or (groupProxy.Position - S.lastStampCenter).Magnitude >= math.min(S.copyCellX, S.copyCellZ) * 0.8
+					if movedFromLast then S.dropFloatingCopies(true) end
+				end
+			end
+		end
+	end
+	if groupDragActive and groupStartPivots then
+		local unitRay = camera:ScreenPointToRay(mouse.X, mouse.Y)
+		if math.abs(unitRay.Direction.Y) > 1e-4 then
+			local t = (groupDragY - unitRay.Origin.Y) / unitRay.Direction.Y
+			if t > 0 then
+				local p = unitRay.Origin + unitRay.Direction * t
+				local ms = moveSnap()
+				local delta = Vector3.new(
+					math.round((p.X - groupDragOrigin.X) / ms) * ms, 0,
+					math.round((p.Z - groupDragOrigin.Z) / ms) * ms
+				)
+				for model, startPivot in pairs(groupStartPivots) do
+					if model.Parent then model:PivotTo(startPivot + delta) end
+				end
+				groupProxy.CFrame = CFrame.new(S.groupProxyStart.Position + delta)
+			end
+		end
+	end
+	if boxDragStart and handleGrab then
+		-- a handle claimed this gesture: abandon the rubber band
+		boxDragStart = nil
+		U.boxFrame.Visible = false
+	end
+	if boxDragStart then
+		local cur = Vector2.new(input.Position.X, input.Position.Y)
+		local topLeft = Vector2.new(math.min(boxDragStart.X, cur.X), math.min(boxDragStart.Y, cur.Y))
+		local size = Vector2.new(math.abs(cur.X - boxDragStart.X), math.abs(cur.Y - boxDragStart.Y))
+		U.boxFrame.Position = UDim2.fromOffset(topLeft.X, topLeft.Y)
+		U.boxFrame.Size = UDim2.fromOffset(size.X, size.Y)
+	end
+	-- engage a pending item-drag only after real movement AND only if
+	-- no handle claimed the gesture first
+	if dragSelPending and selModel and not dragSelActive then
+		if dragStart or rotStart or sizeStart then
+			dragSelPending = false -- a handle won the click
+		elseif dragSelStart and (Vector2.new(input.Position.X, input.Position.Y)
+			- Vector2.new(dragSelStart.X, dragSelStart.Y)).Magnitude > 5 then
+			dragSelActive = true
+			takeSnapshot()
+		end
+	end
+	if not (dragSelActive and selModel) then return end
+	local unitRay = camera:ScreenPointToRay(mouse.X, mouse.Y)
+	if math.abs(unitRay.Direction.Y) < 1e-4 then return end
+	local t = (dragSelY - unitRay.Origin.Y) / unitRay.Direction.Y
+	if t < 0 then return end
+	local p = unitRay.Origin + unitRay.Direction * t
+	local pivot = selModel:GetPivot()
+	local ms = moveSnap()
+	local target = CFrame.new(
+		math.round((p.X + dragSelOffset.X) / ms) * ms,
+		dragSelY,
+		math.round((p.Z + dragSelOffset.Z) / ms) * ms
+	) * pivot.Rotation
+	selModel:PivotTo(clampToPlot(target, selModel))
+	liveSync()
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+		if S.structDragging then S.commitStructureDrag() end
+		S.stampHeld = false
+		if groupDragActive then
+			groupDragActive = false
+			local starts = groupStartPivots
+			groupStartPivots = nil
+			commitGroupRef(starts)
+			refreshGroupHandlesRef()
+		end
+		if boxDragStart then
+			local finish = Vector2.new(input.Position.X, input.Position.Y)
+			U.boxFrame.Visible = false
+			if handleGrab then
+				-- handle drag, not a selection gesture: leave things alone
+			elseif (finish - boxDragStart).Magnitude > 12 then
+				gatherInBox(boxDragStart, finish)
+			else
+				clearBoxSelection()
+				deselect()
+			end
+			boxDragStart = nil
+			S.boxPressModel = nil
+		end
+		dragSelPending = false
+		if dragSelActive then
+			dragSelActive = false
+			if not commitTransform() then restoreSnapshot() end
+		end
+	end
+end)
+
+U.rotateBtn.MouseButton1Click:Connect(function()
+	ghostRotation += ghostWallKind and math.pi or math.rad(90)
+end)
+U.cancelBtn.MouseButton1Click:Connect(function() setMode(nil) end)
+for id, b in pairs(U.toolButtons) do
+	b.MouseButton1Click:Connect(function()
+		setMode(mode == id and nil or id)
+	end)
+end
+-- While build mode is open, hide the player's OTHER interfaces so the
+-- screen stays clean. This only touches OUR PlayerGui, so nobody else is
+-- affected.
+local hiddenGuis = {}
+-- ours, the clock, and the wallet (you need to see money while shopping)
+local KEEP_VISIBLE = { BuildUI = true, ClockUI = true, WalletUI = true }
+
+-- v9: every GUI we disable is TAGGED with an attribute. Recovery below
+-- only wakes tagged interfaces, so GUIs that OTHER systems keep disabled
+-- on purpose (extra inventory panels, templates) are left alone. This is
+-- the fix for the "two inventories" bug.
+local RESTORE_ON_START = true
+
+local function setOtherUIsVisible(visible)
+	local pg = player:FindFirstChildOfClass("PlayerGui")
+	if not pg then return end
+	local ok, err = pcall(function()
+		if visible then
+			-- restore ONLY what we hid, and clear the tags
+			for g in pairs(hiddenGuis) do
+				if g and g.Parent then
+					g.Enabled = true
+					g:SetAttribute("BuildUIHid", nil)
+				end
+			end
+			table.clear(hiddenGuis)
+		else
+			for _, g in ipairs(pg:GetChildren()) do
+				if g:IsA("ScreenGui") and not KEEP_VISIBLE[g.Name] and g.Enabled then
+					hiddenGuis[g] = true
+					g:SetAttribute("BuildUIHid", true)
+					g.Enabled = false
+				end
+			end
+		end
+	end)
+	if not ok then
+		warn("[Build] UI visibility error: " .. tostring(err))
+	end
+end
+
+if RESTORE_ON_START then
+	task.defer(function()
+		local pg = player:FindFirstChildOfClass("PlayerGui")
+		if not pg then return end
+		local fixed = 0
+		for _, g in ipairs(pg:GetChildren()) do
+			-- only interfaces WE disabled in a previous session carry the tag
+			if g:IsA("ScreenGui") and not g.Enabled and g:GetAttribute("BuildUIHid") then
+				g.Enabled = true
+				g:SetAttribute("BuildUIHid", nil)
+				fixed += 1
+			end
+		end
+		if fixed > 0 then
+			print("[Build] re-enabled " .. fixed .. " interface(s) this script hid in a previous session")
+		end
+	end)
+end
+
+-- LEAVING YOUR PLOT closes build mode, so you can't build from next door.
+-- v9: checked on the CLIENT (zero remote calls) and only scheduled while
+-- the dock is open - no idle polling, no per-2s server invokes.
+S.plotWatchToken = 0
+S.startPlotWatch = function()
+	S.plotWatchToken += 1
+	local token = S.plotWatchToken
+	local function step()
+		if token ~= S.plotWatchToken or not U.dock.Visible then return end
+		if myPlotPart() ~= S.homePlot then
+			closeBuildModeRef()
+			U.toast.Text = "Left your plot - build mode closed"
+			U.toast.TextColor3 = C.RED
+			U.toast.Visible = true
+			task.delay(2.6, function() U.toast.Visible = false end)
+			return
+		end
+		task.delay(2, step)
+	end
+	task.delay(2, step)
+end
+
+-- Everything that must happen when build mode closes, in one place:
+-- tools off, shop closed, other interfaces back, selections dropped.
+-- (free-cam lands itself via the dock listener once the dock is hidden.)
+local function closeBuildMode()
+	S.plotWatchToken += 1 -- cancel any pending plot-watch step
+	U.dock.Visible = false
+	player:SetAttribute("BuildDockOpen", false) -- ClockUI reappears
+	U.shop.Visible = false
+	setWalletVisible(true)
+	setMode(nil)
+	deselect()
+	S.clearTraceRef()
+	S.resetLevelView()
+	setOtherUIsVisible(true)
+end
+
+-- message shown when you try to build somewhere you shouldn't
+U.toast = Instance.new("TextLabel")
+U.toast.Size = UDim2.fromOffset(420, 44)
+U.toast.AnchorPoint = Vector2.new(0.5, 1)
+U.toast.Position = UDim2.new(0.5, 0, 1, -120)
+U.toast.BackgroundColor3 = C.PANEL
+U.toast.BackgroundTransparency = 0.08
+U.toast.Font = Enum.Font.GothamBold
+U.toast.TextSize = 15
+U.toast.TextColor3 = C.RED
+U.toast.Text = ""
+U.toast.Visible = false
+U.toast.Parent = U.gui
+corner(U.toast, 12); stroke(U.toast)
+
+local function toast(message, colour)
+	U.toast.Text = message
+	U.toast.TextColor3 = colour or C.RED
+	U.toast.Visible = true
+	task.delay(2.6, function()
+		if U.toast.Text == message then U.toast.Visible = false end
+	end)
+end
+
+local function openBuildMode()
+	-- BUILD GATE: the server decides, based on where you're standing
+	local ok, reason = buildRemote:InvokeServer({ action = "canbuild" })
+	if not ok then
+		toast(tostring(reason or "You can only build at your plot"))
+		return
+	end
+	U.dock.Visible = true
+	player:SetAttribute("BuildDockOpen", true) -- ClockUI hides on mobile while building
+	S.homePlot = myPlotPart() -- the plot this build session belongs to
+	lockBuildPlane()
+	refreshGridPlane()
+	refreshLevelView()
+	setOtherUIsVisible(false)
+	U.header.Text = "BUILD MODE  ·  " .. tostring(reason)
+	S.startPlotWatch()
+end
+
+U.toggle.MouseButton1Click:Connect(function()
+	if U.dock.Visible then closeBuildMode() else openBuildMode() end
+end)
+
+U.exitBtn.MouseButton1Click:Connect(closeBuildMode)
+closeBuildModeRef = closeBuildMode
+
+--------------------------------------------------------------------
+-- THUMBNAILS / TABS / INVENTORY (unchanged behavior from v4)
+--------------------------------------------------------------------
+makeThumbnail = function(model, parent)
+	local vp = Instance.new("ViewportFrame")
+	vp.Size = UDim2.new(1, -10, 0, 118)
+	vp.Position = UDim2.fromOffset(5, 5)
+	vp.BackgroundColor3 = Color3.fromRGB(228, 236, 246)
+	vp.Parent = parent
+	corner(vp, 8)
+	local clone = model:Clone()
+	ensurePrimaryPart(clone)
+	if not clone.PrimaryPart then return end
+	clone.Parent = vp
+	local vpCam = Instance.new("Camera"); vpCam.Parent = vp; vp.CurrentCamera = vpCam
+	local cf, size = clone:GetBoundingBox()
+	local dist = size.Magnitude * 0.88 + 0.8
+	vpCam.CFrame = CFrame.lookAt(cf.Position + Vector3.new(dist*0.7, dist*0.6, dist*0.7), cf.Position)
+end
+
+local INV_TAB = "Inventory"
+local tabButtons2, currentTab = {}, nil
+
+local function clearCards()
+	for _, child in ipairs(U.cardScroll:GetChildren()) do
+		if child:IsA("TextButton") then child:Destroy() end
+	end
+end
+
+local function baseCard(order, name, model)
+	local card = Instance.new("TextButton")
+	card.Size = UDim2.fromOffset(158, 180)
+	card.LayoutOrder = order
+	card.BackgroundColor3 = C.CARD_BG
+	card.Text = ""
+	card.Parent = U.cardScroll
+	corner(card, 10)
+	if model then makeThumbnail(model, card) end
+	local nameLabel = Instance.new("TextLabel")
+	nameLabel.Size = UDim2.new(1, -10, 0, 46)
+	nameLabel.Position = UDim2.fromOffset(5, 126)
+	nameLabel.BackgroundTransparency = 1
+	nameLabel.Font = Enum.Font.GothamBold
+	nameLabel.TextSize = 14
+	nameLabel.TextColor3 = C.TEXT_GRAY
+	nameLabel.TextWrapped = true
+	nameLabel.Text = name
+	nameLabel.Parent = card
+	return card
+end
+
+local function badge(card, text, color)
+	local b = Instance.new("TextLabel")
+	b.Size = UDim2.fromOffset(48, 22)
+	b.Position = UDim2.fromOffset(7, 7)
+	b.BackgroundColor3 = color
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 10
+	b.TextColor3 = C.WHITE
+	b.Text = text
+	b.ZIndex = 3
+	b.Parent = card
+	corner(b, 9)
+	return b
+end
+
+local function showCatalogTab(cat)
+	clearCards()
+	for i, item in ipairs(cat.items) do
+		local card = baseCard(i, item.Name, item)
+		local price = item:GetAttribute("Price")
+		local owned = inventory[item.Name] or 0
+
+		-- gold badge = what it costs, blue badge = how many you're holding
+		if type(price) == "number" and price > 0 then
+			badge(card, money(price), C.GOLD)
+		end
+		if owned > 0 then
+			local b = badge(card, "x" .. owned, C.ACCENT)
+			b.Position = UDim2.new(1, -46, 0, 7) -- top-right, clear of the price
+		end
+
+		card.MouseButton1Click:Connect(function() makeGhost(item.Name, "catalog") end)
+	end
+end
+
+local function showInventoryTab()
+	clearCards()
+	local order, any = 0, false
+	for itemName, count in pairs(inventory) do
+		if count > 0 then
+			any = true
+			order += 1
+			local card = baseCard(order, itemName, findTemplate(itemName))
+			badge(card, "x" .. count, C.ACCENT)
+			local sell = Instance.new("TextButton")
+			sell.Size = UDim2.fromOffset(46, 22)
+			sell.Position = UDim2.new(1, -53, 0, 7)
+			sell.BackgroundColor3 = C.GOLD
+			sell.Font = Enum.Font.GothamBold
+			sell.TextSize = 10
+			sell.TextColor3 = C.WHITE
+			local tmpl = findTemplate(itemName)
+			local p = tmpl and tmpl:GetAttribute("Price")
+			local payout = (type(p) == "number") and math.floor(p * 0.5) or 0
+			sell.Text = (payout > 0) and ("Sell " .. payout) or "Sell"
+			sell.ZIndex = 3
+			sell.Parent = card
+			corner(sell, 9)
+			sell.MouseButton1Click:Connect(function()
+				local ok, refund = buildRemote:InvokeServer({ action = "sell", item = itemName })
+				if ok then flash("Sold" .. ((refund and refund > 0) and (" for " .. money(refund)) or "") .. "!") end
+			end)
+			card.MouseButton1Click:Connect(function() makeGhost(itemName, "inv") end)
+		end
+	end
+	if not any then
+		local note = Instance.new("TextButton")
+		note.Size = UDim2.fromOffset(260, 104)
+		note.BackgroundTransparency = 1
+		note.Font = Enum.Font.Gotham
+		note.TextSize = 12
+		note.TextColor3 = C.TEXT_GRAY
+		note.Text = "Nothing here yet - removed\nfurniture is stored for you!"
+		note.Parent = U.cardScroll
+	end
+end
+
+local function selectTab(name)
+	currentTab = name
+	for n, b in pairs(tabButtons2) do
+		b.BackgroundColor3 = (n == name) and C.ACCENT or C.CARD_BG
+		b.TextColor3 = (n == name) and C.WHITE or C.TEXT_GRAY
+	end
+	if name == INV_TAB then showInventoryTab()
+	else
+		for _, cat in ipairs(categories) do
+			if cat.name == name then showCatalogTab(cat) break end
+		end
+	end
+end
+
+local function makeTab(name, order)
+	local tab = Instance.new("TextButton")
+	tab.Size = UDim2.fromOffset(math.max(78, #name * 9 + 28), 32)
+	tab.LayoutOrder = order
+	tab.BackgroundColor3 = C.CARD_BG
+	tab.Font = Enum.Font.GothamBold
+	tab.TextSize = 13
+	tab.TextColor3 = C.TEXT_GRAY
+	tab.Text = name
+	tab.Parent = U.tabRow
+	corner(tab, 13)
+	tabButtons2[name] = tab
+	tab.MouseButton1Click:Connect(function() selectTab(name) end)
+end
+
+if #categories > 0 then
+	for order, cat in ipairs(categories) do makeTab(cat.name, order) end
+	makeTab(INV_TAB, #categories + 1)
+	selectTab(categories[1].name)
+else
+	makeTab(INV_TAB, 1)
+	selectTab(INV_TAB)
+	U.header.Text = furnitureFolder
+		and "Furniture folder is empty - add Models or category Folders!"
+		or "Add a 'Furniture' folder in ReplicatedStorage!"
+end
+
+-- Late UI/controllers are initialized in a separate function scope so this
+-- large LocalScript does not exceed Luau's 200-local-register limit.
+function S.initializeLateBuildUI()
+	--------------------------------------------------------------------
+	-- BUILD FREE-CAM (📷): fly around while building. WASD move, Q/E
+	-- down/up, hold RIGHT MOUSE to look, Shift = fast. Tools stay usable.
+	-- v9: the camera render loop only EXISTS while flying.
+	--------------------------------------------------------------------
+	U.flyBtn = Instance.new("TextButton")
+	U.flyBtn.Size = UDim2.fromOffset(44, 44)
+	U.flyBtn.AnchorPoint = Vector2.new(1, 1)
+	U.flyBtn.Position = UDim2.new(1, -14, 1, -402)
+	U.flyBtn.BackgroundColor3 = C.PANEL
+	U.flyBtn.Text = "Cam"
+	U.flyBtn.TextSize = 11
+	U.flyBtn.TextColor3 = C.TEXT_GRAY
+	U.flyBtn.Visible = false
+	U.flyBtn.Parent = U.gui
+	corner(U.flyBtn, 12); stroke(U.flyBtn)
+
+	flying = false
+	local camYaw, camPitch = 0, -0.4
+	local camPos = Vector3.zero
+	local savedWalkSpeed = 16
+	local touchMove = { fwd = 0, side = 0, up = 0 } -- fed by the mobile pad
+	S.setCamLoopRef = function(_) end -- real version assigned after camStep
+
+	local function setFlying(on)
+		flying = on
+		U.flyBtn.BackgroundColor3 = on and C.ACCENT or C.PANEL
+		U.flyBtn.TextColor3 = on and C.WHITE or C.TEXT_GRAY
+		U.flyPad.Visible = on and UserInputService.TouchEnabled
+		U.flySpeedFrame.Visible = on
+		local humanoid = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+		local root = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+		if on then
+			camPos = camera.CFrame.Position
+			local look = camera.CFrame.LookVector
+			camYaw = math.atan2(-look.X, -look.Z)
+			camPitch = math.asin(look.Y)
+			camera.CameraType = Enum.CameraType.Scriptable
+			if humanoid then
+				savedWalkSpeed = humanoid.WalkSpeed
+				humanoid.WalkSpeed = 0
+			end
+			-- Park the character neatly ON THE GROUND (no mid-air freezing),
+			-- then anchor so other players see a standing person, not a floater
+			if root then
+				local params = RaycastParams.new()
+				params.FilterType = Enum.RaycastFilterType.Exclude
+				params.FilterDescendantsInstances = { player.Character }
+				local hit = workspace:Raycast(root.Position, Vector3.new(0, -60, 0), params)
+				if hit then
+					local look2 = root.CFrame.LookVector
+					root.CFrame = CFrame.lookAt(
+						Vector3.new(root.Position.X, hit.Position.Y + 3, root.Position.Z),
+						Vector3.new(root.Position.X + look2.X, hit.Position.Y + 3, root.Position.Z + look2.Z)
+					)
+				end
+				root.Anchored = true
+			end
+		else
+			camera.CameraType = Enum.CameraType.Custom
+			UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+			if humanoid then humanoid.WalkSpeed = savedWalkSpeed end
+			if root then root.Anchored = false end
+			-- belt and braces: never leave a character frozen
+			local ch = player.Character
+			if ch then
+				local hrp = ch:FindFirstChild("HumanoidRootPart")
+				if hrp then hrp.Anchored = false end
+				local h = ch:FindFirstChildOfClass("Humanoid")
+				if h and h.WalkSpeed == 0 then h.WalkSpeed = savedWalkSpeed end
+			end
+		end
+		S.setCamLoopRef(on) -- connect/disconnect the per-frame camera step
+	end
+
+	U.flyBtn.MouseButton1Click:Connect(function() setFlying(not flying) end)
+
+	S.freeCamSpeeds = { 10, 20, 35, 50, 75, 100 }
+	S.freeCamSpeedIndex = 3
+	S.freeCamSpeed = S.freeCamSpeeds[S.freeCamSpeedIndex]
+	U.flySpeedFrame = Instance.new("Frame")
+	U.flySpeedFrame.Size = UDim2.fromOffset(184, 44)
+	U.flySpeedFrame.AnchorPoint = Vector2.new(1, 1)
+	U.flySpeedFrame.Position = UDim2.new(1, -64, 1, -402)
+	U.flySpeedFrame.BackgroundColor3 = C.PANEL
+	U.flySpeedFrame.Visible = false
+	U.flySpeedFrame.Parent = U.gui
+	corner(U.flySpeedFrame, 12); stroke(U.flySpeedFrame)
+	local function speedButton(text, x, w)
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.fromOffset(w, 32); b.Position = UDim2.fromOffset(x, 6)
+		b.BackgroundColor3 = C.CARD_BG; b.Font = Enum.Font.GothamBold; b.TextSize = 12
+		b.TextColor3 = C.TEXT_GRAY; b.Text = text; b.Parent = U.flySpeedFrame
+		corner(b, 8); return b
+	end
+	U.speedDown = speedButton("−", 6, 34)
+	U.speedLabel = speedButton("Camera: 35", 44, 96)
+	U.speedLabel.AutoButtonColor = false
+	U.speedUp = speedButton("+", 144, 34)
+	local function refreshFreeCamSpeed()
+		S.freeCamSpeed = S.freeCamSpeeds[S.freeCamSpeedIndex]
+		U.speedLabel.Text = "Camera: " .. S.freeCamSpeed
+	end
+	U.speedDown.MouseButton1Click:Connect(function()
+		S.freeCamSpeedIndex = math.max(1, S.freeCamSpeedIndex - 1); refreshFreeCamSpeed()
+	end)
+	U.speedUp.MouseButton1Click:Connect(function()
+		S.freeCamSpeedIndex = math.min(#S.freeCamSpeeds, S.freeCamSpeedIndex + 1); refreshFreeCamSpeed()
+	end)
+	refreshFreeCamSpeed()
+
+	-- If we respawn mid-flight, drop out of free-cam cleanly (the old
+	-- character - and its anchor - is gone)
+	player.CharacterAdded:Connect(function()
+		if flying then
+			setFlying(false)
+		end
+	end)
+
+	--------------------------------------------------------------------
+	-- MOBILE FREE-CAM CONTROLS: on-screen movement pad + drag to look
+	--------------------------------------------------------------------
+	U.flyPad = Instance.new("Frame")
+	U.flyPad.Size = UDim2.fromOffset(150, 108)
+	U.flyPad.AnchorPoint = Vector2.new(0, 1)
+	-- v9.5: anchored to the BOTTOM-left and kept low so its up/down arrows no
+	-- longer rise behind the coin purse (WalletUI) at the top-left corner.
+	U.flyPad.Position = UDim2.new(0, 12, 1, -140)
+	U.flyPad.BackgroundTransparency = 1
+	U.flyPad.Visible = false
+	U.flyPad.Parent = U.gui
+
+	local function padBtn(text, x, y, onDown, onUp)
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.fromOffset(44, 34)
+		b.Position = UDim2.fromOffset(x, y)
+		b.BackgroundColor3 = C.PANEL
+		b.BackgroundTransparency = 0.1
+		b.Font = Enum.Font.GothamBold
+		b.TextSize = 16
+		b.TextColor3 = C.TEXT_GRAY
+		b.Text = text
+		b.Parent = U.flyPad
+		corner(b, 8); stroke(b)
+		b.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.Touch
+				or input.UserInputType == Enum.UserInputType.MouseButton1 then onDown() end
+		end)
+		b.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.Touch
+				or input.UserInputType == Enum.UserInputType.MouseButton1 then onUp() end
+		end)
+		return b
+	end
+
+	padBtn("▲", 50, 0,  function() touchMove.fwd = 1 end,  function() touchMove.fwd = 0 end)
+	padBtn("◀", 2, 37,  function() touchMove.side = -1 end, function() touchMove.side = 0 end)
+	padBtn("▶", 98, 37, function() touchMove.side = 1 end,  function() touchMove.side = 0 end)
+	padBtn("▼", 50, 74, function() touchMove.fwd = -1 end,  function() touchMove.fwd = 0 end)
+	padBtn("↑", 2, 0,   function() touchMove.up = 1 end,    function() touchMove.up = 0 end)
+	padBtn("↓", 98, 0,  function() touchMove.up = -1 end,   function() touchMove.up = 0 end)
+
+	-- drag anywhere on empty screen to look around while flying
+	UserInputService.TouchMoved:Connect(function(touch, gameProcessed)
+		if not flying or gameProcessed then return end
+		camYaw -= touch.Delta.X * 0.006
+		camPitch = math.clamp(camPitch - touch.Delta.Y * 0.006, -1.4, 1.4)
+	end)
+
+	-- The per-frame camera step. v9: this is CONNECTED only while flying
+	-- and disconnected on landing (no idle per-frame work, ever).
+	local camConn = nil
+	local function camStep(dt)
+		-- look while holding right mouse
+		if UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+			UserInputService.MouseBehavior = Enum.MouseBehavior.LockCurrentPosition
+			local delta = UserInputService:GetMouseDelta()
+			camYaw -= delta.X * 0.005
+			camPitch = math.clamp(camPitch - delta.Y * 0.005, -1.4, 1.4)
+		else
+			UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+		end
+
+		local rot = CFrame.fromEulerAnglesYXZ(camPitch, camYaw, 0)
+		local speed = S.freeCamSpeed * (UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) and 2.5 or 1)
+		local move = Vector3.zero
+		if UserInputService:IsKeyDown(Enum.KeyCode.W) then move += rot.LookVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.S) then move -= rot.LookVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.D) then move += rot.RightVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.A) then move -= rot.RightVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.E) then move += Vector3.yAxis end
+		if UserInputService:IsKeyDown(Enum.KeyCode.Q) then move -= Vector3.yAxis end
+		-- touch pad input
+		move += rot.LookVector * touchMove.fwd
+		move += rot.RightVector * touchMove.side
+		move += Vector3.yAxis * touchMove.up
+		if move.Magnitude > 0 then
+			camPos += move.Unit * speed * dt
+		end
+		camera.CFrame = CFrame.new(camPos) * rot
+	end
+	S.setCamLoopRef = function(on)
+		if on and not camConn then
+			camConn = RunService.RenderStepped:Connect(camStep)
+		elseif not on and camConn then
+			camConn:Disconnect()
+			camConn = nil
+		end
+	end
+
+	--------------------------------------------------------------------
+	-- BUILD-MODE TIME PREVIEW (client-side ONLY: your screen changes,
+	-- the shared world clock and everyone else's sky stay untouched).
+	-- v9: event-driven. The server rewrites Lighting.ClockTime every
+	-- heartbeat; that PROPERTY CHANGE re-applies the local preview.
+	--------------------------------------------------------------------
+	local Lighting = game:GetService("Lighting")
+	local timeOverride = nil -- nil = live server time
+
+	local applyingTime = false
+	local function applyTimeOverride()
+		if timeOverride == nil or applyingTime then return end
+		applyingTime = true
+		-- ClockTime right now holds the freshly-replicated REAL server time -
+		-- stash it for the clock UI, THEN apply our local visual override
+		player:SetAttribute("BuildRealTime", Lighting.ClockTime)
+		player:SetAttribute("BuildTimePreview", true)
+		Lighting.ClockTime = timeOverride
+		applyingTime = false
+	end
+	Lighting:GetPropertyChangedSignal("ClockTime"):Connect(applyTimeOverride)
+
+	U.timeBar = Instance.new("Frame")
+	U.timeBar.Size = UDim2.fromOffset(74, 178)
+	U.timeBar.AnchorPoint = Vector2.new(1, 1)
+	U.timeBar.Position = UDim2.new(1, -14, 1, -456)
+	U.timeBar.BackgroundColor3 = C.PANEL
+	U.timeBar.Visible = false
+	U.timeBar.Parent = U.gui
+	corner(U.timeBar, 12); stroke(U.timeBar)
+
+	U.timeButtons = {}
+	U.TIME_PRESETS = {
+		{ "Day", 13,  "Day" },
+		{ "Dusk", 18.2, "Sunset" },
+		{ "Night", 0,   "Night" },
+		{ "Live", nil, "Live" },
+	}
+	for i, def in ipairs(U.TIME_PRESETS) do
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.fromOffset(64, 34)
+		b.Position = UDim2.fromOffset(5, 5 + (i-1) * 43)
+		b.BackgroundColor3 = C.CARD_BG
+		b.Font = Enum.Font.GothamBold
+		b.TextSize = 10
+		b.TextColor3 = C.TEXT_GRAY
+		b.Text = def[1]
+		b.Parent = U.timeBar
+		corner(b, 8)
+		U.timeButtons[i] = b
+		b.MouseButton1Click:Connect(function()
+			timeOverride = def[2]
+			for j, btn in ipairs(U.timeButtons) do
+				btn.BackgroundColor3 = (j == i) and C.ACCENT or C.CARD_BG
+			end
+			if timeOverride == nil then
+				player:SetAttribute("BuildTimePreview", false)
+			else
+				applyTimeOverride()
+			end
+			flash(def[2] and ("Previewing " .. def[3] .. " (only you see this)") or "Back to live time")
+		end)
+	end
+	U.timeButtons[4].BackgroundColor3 = C.ACCENT
+
+	-- One dock listener drives every dock-dependent panel and handles all
+	-- exit paths (button, Escape, dying, leaving the plot) - no per-frame
+	-- visibility checks anywhere.
+	U.dock:GetPropertyChangedSignal("Visible"):Connect(function()
+		local open = U.dock.Visible
+		U.flyBtn.Visible = open
+		U.timeBar.Visible = open
+		U.viewFrame.Visible = open
+		if open then
+			-- v9.3: mobile builders get free-cam ON by default the first time
+			-- they open build mode this session - dragging the world around a
+			-- fixed avatar is far easier than thumb-walking while placing walls.
+			-- (Only auto-armed once, so tapping Cam to land is respected after.)
+			if UserInputService.TouchEnabled and not S.autoFlewThisSession and not flying then
+				S.autoFlewThisSession = true
+				task.defer(function()
+					if U.dock.Visible and not flying then setFlying(true) end
+				end)
+			end
+			return
+		end
+		if flying then setFlying(false) end
+		if timeOverride ~= nil then
+			timeOverride = nil -- closing build mode returns to live time
+			player:SetAttribute("BuildTimePreview", false)
+			for j, btn in ipairs(U.timeButtons) do
+				btn.BackgroundColor3 = (j == 4) and C.ACCENT or C.CARD_BG
+			end
+		end
+	end)
+
+	invRemote.OnClientEvent:Connect(function(inv, balance)
+		if type(inv) ~= "table" then return end
+		inventory = inv
+		if type(balance) == "number" then
+			S.balance = balance
+		end
+		if U.shop.Visible then
+			local attrBalance = player:GetAttribute("Wallet")
+			U.shopBalance.Text = money(type(attrBalance) == "number" and attrBalance or (S.balance or 0))
+		end
+		-- keep whatever tab you're looking at in step with your stock
+		if currentTab == INV_TAB then
+			showInventoryTab()
+		elseif currentTab then
+			for _, cat in ipairs(categories) do
+				if cat.name == currentTab then showCatalogTab(cat) break end
+			end
+		end
+		if U.shop.Visible then
+			S.shopOwned = inv
+			renderShopRef()
+		end
+	end)
+
+
+	--------------------------------------------------------------------
+	-- RESPONSIVE LAYOUT: keeps the dock (and the floating bars) on screen
+	-- on laptops, small windows and phones instead of spilling off the edge
+	--------------------------------------------------------------------
+	local function layout()
+		local vp = camera.ViewportSize
+		-- v9.2: RESOLUTION-INDEPENDENT sizing. Devices report viewport units
+		-- inconsistently, so instead of guessing "is this a phone?" with a
+		-- pixel threshold (which silently failed on iPhones), the dock is
+		-- simply never allowed to exceed ~42% of the screen's height.
+		local touch = UserInputService.TouchEnabled
+		local compact = touch or vp.X < 1150
+		local tileH = compact and 44 or 52
+		local gap = 6
+		local margin = 10
+
+		-- ONE shared width budget for ALL 12 buttons, computed FORWARD from
+		-- the left. The old version anchored actions from the right, which
+		-- made Shop/Clear land on top of the Sell tool on narrow screens.
+		local actions = { U.shopAction, U.bulldozeAction, U.undoAction, U.copyAction, U.delAction }
+		local slots = #U.toolDefs + #actions
+		local budget = vp.X - 16 - margin * 2 - 12 - gap * (slots - 1)
+		local tileW = math.clamp(math.floor(budget / slots), 44, compact and 64 or 84)
+		local width = margin * 2 + 12 + slots * tileW + gap * (slots - 1)
+		width = math.min(width, vp.X - 16)
+		local dockH = compact and 302 or 334 -- larger, readable furniture previews
+
+		-- Phones: ONE UIScale shrinks the whole dock about its bottom-center
+		-- anchor - a single property write, batched by the engine into one
+		-- layout pass, instead of resizing dozens of children one by one.
+		if not U.dockScale then
+			U.dockScale = Instance.new("UIScale")
+			U.dockScale.Parent = U.dock
+		end
+		local s = math.clamp((vp.Y * 0.42) / dockH, 0.5, 1)
+		U.dockScale.Scale = s
+
+		U.dock.Size = UDim2.fromOffset(width, dockH)
+
+		for i, def in ipairs(U.toolDefs) do
+			local b = U.toolButtons[def.id]
+			if b then
+				b.Size = UDim2.fromOffset(tileW, tileH)
+				b.Position = UDim2.fromOffset(margin + (i - 1) * (tileW + gap), 26)
+				local lb = U.toolLabels[def.id]
+				if lb then
+					lb.TextSize = compact and 10 or 12
+					lb.Position = UDim2.fromOffset(0, tileH - 18)
+				end
+			end
+		end
+
+		-- Actions CONTINUE the same row after the tools (forward-computed),
+		-- so overlap is geometrically impossible at any viewport width.
+		local actStart = margin + #U.toolDefs * (tileW + gap) + 12
+		for i, b in ipairs(actions) do
+			b.Size = UDim2.fromOffset(tileW, tileH)
+			b.Position = UDim2.fromOffset(actStart + (i - 1) * (tileW + gap), 26)
+			for _, child in ipairs(b:GetChildren()) do
+				if child:IsA("TextLabel") then
+					child.TextSize = compact and 10 or 12
+					child.Position = UDim2.fromOffset(0, tileH - 18)
+				end
+			end
+		end
+
+		-- rows below the tool strip
+		U.tabRow.Position = UDim2.fromOffset(10, 26 + tileH + 8)
+		U.tabRow.Size = UDim2.new(1, -20, 0, 32)
+		U.cardScroll.Position = UDim2.fromOffset(10, 26 + tileH + 46)
+		U.cardScroll.Size = UDim2.new(1, -20, 0, dockH - (26 + tileH + 54))
+
+		-- floating bars sit just above the dock, never on top of it.
+		-- The dock's SCALED height is what matters on phones.
+		local above = math.floor(dockH * s) + 26
+		S.railAbove = above
+
+		-- Wide bars carry their own UIScale so they shrink-to-fit narrow
+		-- screens instead of clipping (Scale-based sizing, rule-compliant).
+		local function fitBar(bar, designWidth)
+			local sc = bar:FindFirstChildOfClass("UIScale")
+			if not sc then sc = Instance.new("UIScale"); sc.Parent = bar end
+			sc.Scale = math.min(1, (vp.X - 24) / designWidth, s + 0.12)
+		end
+		fitBar(U.selBar, 700)
+		fitBar(U.boxBar, 692)
+		fitBar(U.roofQuickBar, 380)
+
+		U.selBar.Position = UDim2.new(0.5, 0, 1, -above)
+		U.selBar.Size = UDim2.fromOffset(684, 112)
+		U.boxBar.Position = UDim2.new(0.5, 0, 1, -above)
+		U.boxBar.Size = UDim2.fromOffset(676, 52)
+		U.rotateBtn.Position = UDim2.new(0.5, -34, 1, -above)
+		U.cancelBtn.Position = UDim2.new(0.5, 34, 1, -above)
+		U.placeBtn.Position = UDim2.new(0.5, -102, 1, -above)
+
+		-- v9.3 MOBILE SIDE PANELS: the tall right-edge panels (Wall Placement,
+		-- Roof Style, level buttons, view toggles) used to sit at fixed offsets
+		-- ABOVE the dock, so on short screens they clipped off the top. Each now
+		-- carries a UIScale and is anchored just above the dock, scaled to fit.
+		local sideScale = touch and math.clamp(s, 0.7, 0.9) or 1
+		local function fitSide(panel, offX, offY)
+			local sc = panel:FindFirstChildOfClass("UIScale")
+			if not sc then sc = Instance.new("UIScale"); sc.Parent = panel end
+			sc.Scale = sideScale
+			panel.Position = UDim2.new(1, offX, 1, -(above + offY))
+		end
+		fitSide(U.levelFrame, -14, 0)
+		fitSide(U.viewFrame, -64, touch and 96 or 140)
+		fitSide(U.wallPanel, -64, 0)
+		fitSide(U.shapeBtn, -64, 0)
+		U.roofQuickBar.Position = UDim2.new(0.5, 0, 1, -(above + (touch and 96 or 118)))
+		U.windowBar.Position = UDim2.new(0.5, 0, 1, -(above + 64))
+		U.palette.Position = UDim2.new(1, -70, 1, -above)
+		U.flyPad.Position = UDim2.new(0, 12, 1, -140)
+
+		-- Trim panel: scrollable, clamped to the space above the dock, so it
+		-- can never run past the top of the screen again.
+		U.trimPanel.Position = UDim2.new(1, -14, 1, -above)
+		U.trimPanel.Size = UDim2.fromOffset(180, math.max(160, math.min(590, vp.Y - above - 12)))
+
+		S.layoutRightRail()
+	end
+
+	-- RIGHT-RAIL STACKING: the tall trim panel and the paint pill / camera /
+	-- time controls all share the right edge. When trim opens they slide left
+	-- in one batched pass; when it closes they slide back. Purely event-driven
+	-- (a Visible listener), no per-frame checks.
+	S.layoutRightRail = function()
+		local above = S.railAbove or 328
+		local shift = U.trimPanel.Visible and 202 or 0
+		U.paintPill.Position = UDim2.new(1, -(14 + shift), 1, -above)
+		U.flyBtn.Position = UDim2.new(1, -(14 + shift), 1, -(above + 234))
+		U.flySpeedFrame.Position = UDim2.new(1, -(64 + shift), 1, -(above + 234))
+		U.timeBar.Position = UDim2.new(1, -(14 + shift), 1, -(above + 288))
+	end
+	U.trimPanel:GetPropertyChangedSignal("Visible"):Connect(S.layoutRightRail)
+
+	layout()
+	camera:GetPropertyChangedSignal("ViewportSize"):Connect(layout)
+end
+
+S.initializeLateBuildUI()
+S.initializeLateBuildUI = nil
+print("[BuildClient v9.5] GUI initialized - responsive mobile layout, two-sided walls")
