@@ -1,0 +1,2187 @@
+--[[
+	PlotSystemServer v9.3 (Script)
+	LOCATION: ServerScriptService - paste over the previous version
+
+	New in v9.3:
+	  - One canonical saved wallet for build shop, admin grants and purchases
+	  - Wallet attribute + leaderboard mirror update immediately
+	  - Roof server applies grid/edge exactly once
+
+	Previously:
+	  - LEVELS: walls/floors/roofs build at Basement / Ground / 2nd / 3rd
+	  - TRANSFORM: move / rotate / scale placed furniture (select tool)
+	  - RESIZE: stretch walls & floors after placing
+	  - PAINT: material + color on structures
+	  - All of it persisted (scale, size, paint, level heights)
+
+	MAP NOTE: keep plot Parts as THIN PADS (1-2 studs) with empty space
+	below them - that's what makes basements possible.
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+local DataStoreService = game:GetService("DataStoreService")
+local Players = game:GetService("Players")
+
+--------------------------------------------------------------------
+-- REMOTES FIRST. Every client UI (plot picker, party panel, build dock)
+-- waits on these, so they must exist before this script does ANY waiting
+-- of its own - otherwise a slow lookup here strands every interface.
+--------------------------------------------------------------------
+-- Reuse one canonical copy of every remote. Running old PlotServer copies
+-- used to create duplicate PlotBuild/PlotInv instances; clients could then
+-- bind to an unhandled duplicate, leaving the GUI, shop and selection dead.
+local function canonicalRemote(name, className)
+	local chosen = nil
+	for _, child in ipairs(ReplicatedStorage:GetChildren()) do
+		if child.Name == name then
+			if child.ClassName == className and not chosen then
+				chosen = child
+			else
+				warn("[PlotSystem] Removing duplicate/invalid remote: " .. child:GetFullName())
+				child:Destroy()
+			end
+		end
+	end
+	if not chosen then
+		chosen = Instance.new(className)
+		chosen.Name = name
+		chosen.Parent = ReplicatedStorage
+	end
+	chosen:SetAttribute("BuildSystemCanonical", true)
+	return chosen
+end
+
+local claimRemote = canonicalRemote("PlotClaim", "RemoteFunction")
+local infoRemote  = canonicalRemote("PlotsInfo", "RemoteEvent")
+local partyRemote = canonicalRemote("PlotParty", "RemoteEvent")
+local buildRemote = canonicalRemote("PlotBuild", "RemoteFunction")
+local invRemote   = canonicalRemote("PlotInv", "RemoteEvent")
+
+local plotsFolder = workspace:WaitForChild("Plots", 30)
+if not plotsFolder then
+	warn("[PlotSystem] No 'Plots' folder in Workspace - plots are disabled, "
+		.. "but the remotes above still exist so your other UI keeps working.")
+	return
+end
+
+local furnitureFolder = ReplicatedStorage:FindFirstChild("Furniture")
+-- shared roof geometry (same module the client previews with)
+local RoofShapes = nil
+task.spawn(function() -- loaded in the background; never blocks startup
+	local mod = ReplicatedStorage:FindFirstChild("RoofShapes")
+		or ReplicatedStorage:WaitForChild("RoofShapes", 15)
+	if mod then
+		local ok, result = pcall(require, mod)
+		if ok then RoofShapes = result end
+	end
+	if not RoofShapes then
+		warn("[PlotSystem] No 'RoofShapes' ModuleScript - shaped roofs will be flat.")
+	end
+end)
+if not RoofShapes then
+	warn("[PlotSystem] No 'RoofShapes' ModuleScript in ReplicatedStorage - "
+		.. "shaped roofs will fall back to flat slabs.")
+end
+local store = DataStoreService:GetDataStore("PlotData_v2")
+
+local MarketplaceService = game:GetService("MarketplaceService")
+
+local BuildPermissions = nil
+do
+	local mod = ServerScriptService:FindFirstChild("BuildPermissions")
+	if mod and mod:IsA("ModuleScript") then
+		local ok, result = pcall(require, mod)
+		if ok then BuildPermissions = result else warn("[PlotSystem] BuildPermissions failed: " .. tostring(result)) end
+	end
+end
+
+--============================ CONFIG ============================--
+local GRID = 1
+local MAX_ITEMS = 200
+local BOUNDS_MARGIN = 2
+local WALL_HEIGHT = 8
+local WALL_THICKNESS = 0.5
+local WALL_COLOR = Color3.fromRGB(235, 235, 230)
+local FLOOR_THICKNESS = 0.4
+local FLOOR_COLOR = Color3.fromRGB(196, 168, 130)
+local ROOF_COLOR = Color3.fromRGB(120, 70, 60)
+local SELL_REFUND = 0.5
+-- currency name for messages (mirrors ReplicatedStorage.Currency)
+local CURRENCY_NAME = "Sprig"
+local CURRENCY_PLURAL = "Sprigs"
+task.spawn(function() -- background: a missing module must not stall anything
+	local mod = ReplicatedStorage:FindFirstChild("Currency")
+		or ReplicatedStorage:WaitForChild("Currency", 15)
+	if mod then
+		local ok, result = pcall(require, mod)
+		if ok and result then
+			if result.NAME then CURRENCY_NAME = tostring(result.NAME) end
+			if result.PLURAL then CURRENCY_PLURAL = tostring(result.PLURAL) end
+		end
+	end
+end)
+-- Which way door/window MODELS face when seated in a wall. If your doors
+-- spawn backwards, change this to 0 (or 90/270 for sideways models).
+-- Walls are built with their LENGTH along the forward axis, so wall-fit
+-- items need a quarter turn to face out of the wall face (not along it).
+local WALL_ITEM_YAW = 90
+local STARTING_CASH = 2500  -- what a brand-new player begins with
+local TELEPORT_COOLDOWN = 30 -- seconds between invite teleports
+local BASE_SLOTS = 3
+local PREMIUM_SLOTS = 5
+local PREMIUM_PASS_ID = 0   -- paste your gamepass id here when created
+local MIN_LEVEL, MAX_LEVEL = -1, 3   -- basement .. 3rd story
+local SCALE_MIN, SCALE_MAX = 0.5, 2  -- furniture uniform scale
+local ALLOWED_MATERIALS = {
+	SmoothPlastic = true, Brick = true, Wood = true, WoodPlanks = true,
+	Concrete = true, Marble = true, Granite = true, Slate = true,
+	Fabric = true, Metal = true, Cobblestone = true, Pebble = true,
+	Sandstone = true, Limestone = true, Pavement = true, Asphalt = true,
+	Ice = true, Glass = true,
+}
+--================================================================--
+
+
+--------------------------------------------------------------------
+-- Accept plot pads that are Parts OR Models (uses the model's
+-- PrimaryPart, else its biggest part) - grouping a pad with decorations
+-- used to make it invisible to the whole system
+local function padOf(child)
+	if child:IsA("BasePart") then return child end
+	if child:IsA("Model") then
+		if child.PrimaryPart then return child.PrimaryPart end
+		local biggest, best = nil, 0
+		for _, p in ipairs(child:GetDescendants()) do
+			if p:IsA("BasePart") then
+				local v = p.Size.X * p.Size.Z
+				if v > best then biggest, best = p, v end
+			end
+		end
+		return biggest
+	end
+	return nil
+end
+
+local plots = {}
+for _, child in ipairs(plotsFolder:GetChildren()) do
+	local p = padOf(child)
+	if p then
+		-- Defensive hardening: an unanchored pad falls into the void at
+		-- runtime and drags every teleport with it; a non-collidable pad
+		-- drops players straight through. Force-fix and shout about it.
+		if not p.Anchored then
+			warn("[PlotSystem] Plot '" .. p.Name .. "' was NOT anchored - anchoring it. (This causes plots flying off / death loops!)")
+			p.Anchored = true
+		end
+		if not p.CanCollide then
+			warn("[PlotSystem] Plot '" .. p.Name .. "' had CanCollide OFF - enabling it. (Players were falling through!)")
+			p.CanCollide = true
+		end
+		table.insert(plots, p)
+	end
+end
+table.sort(plots, function(a, b) return a.Name < b.Name end)
+
+if #plots == 0 then
+	warn("[PlotSystem] FOUND 0 PLOTS! The 'Plots' folder in Workspace has no "
+		.. "Parts (or Models containing Parts) inside. The plot picker will be empty.")
+else
+	print("[PlotSystem] " .. #plots .. " plots ready: " ..
+		(function()
+			local names = {}
+			for _, p in ipairs(plots) do table.insert(names, p.Name) end
+			return table.concat(names, ", ")
+		end)())
+end
+
+local claims, playerPlot, members = {}, {}, {}
+
+-- AUTOSAVE bookkeeping. Defined up here because the build handler calls
+-- markDirty() long before the autosave loop appears further down.
+local dirty = {}
+local function markDirty(player)
+	if player and playerPlot[player] then dirty[player] = true end
+end
+local pendingInvites = {}
+local lastTeleport = {} -- [player] = os.clock() of their last invite teleport
+local playerData = {}
+
+-- Reuse the same world folder the client selects/raycasts against.
+-- Multiple PlacedItems folders are another symptom of running old server
+-- copies at once and make walls/floors appear unselectable.
+local itemsRoot = workspace:FindFirstChild("PlacedItems")
+if not (itemsRoot and itemsRoot:IsA("Folder")) then
+	if itemsRoot then itemsRoot:Destroy() end
+	itemsRoot = Instance.new("Folder")
+	itemsRoot.Name = "PlacedItems"
+	itemsRoot.Parent = workspace
+end
+itemsRoot:SetAttribute("BuildSystemCanonical", true)
+local plotItemFolders = {}
+
+local function getItemFolder(idx)
+	if not plotItemFolders[idx] then
+		local f = Instance.new("Folder"); f.Name = "Plot" .. idx; f.Parent = itemsRoot
+		plotItemFolders[idx] = f
+	end
+	return plotItemFolders[idx]
+end
+
+--------------------------------------------------------------------
+-- HELPERS
+--------------------------------------------------------------------
+local function ensurePrimaryPart(model)
+	if model.PrimaryPart then return true end
+	local biggest, size = nil, 0
+	for _, part in ipairs(model:GetDescendants()) do
+		if part:IsA("BasePart") then
+			local s = part.Size.X * part.Size.Y * part.Size.Z
+			if s > size then biggest, size = part, s end
+		end
+	end
+	model.PrimaryPart = biggest
+	return biggest ~= nil
+end
+
+local function findTemplate(itemName)
+	if not furnitureFolder then return nil end
+	local direct = furnitureFolder:FindFirstChild(itemName)
+	if direct and direct:IsA("Model") then return direct end
+	local deep = furnitureFolder:FindFirstChild(itemName, true)
+	if deep and deep:IsA("Model") then return deep end
+	return nil
+end
+
+--------------------------------------------------------------------
+-- MONEY BRIDGE: works with whatever your token script actually calls its
+-- functions. On startup it prints the API it found, so mismatches are
+-- obvious instead of throwing "attempt to call a nil value".
+--------------------------------------------------------------------
+-- The plot save is the single source of truth for currency. Previous
+-- versions mixed TokenService, a zero-valued Tokens leaderstat, WalletServer,
+-- and d.cash; whichever answered first could overwrite the others.
+local function walletData(player)
+	return playerData[player]
+end
+
+local function currencyStat(player, create)
+	local ls = player:FindFirstChild("leaderstats")
+	if not ls and create then
+		ls = Instance.new("Folder")
+		ls.Name = "leaderstats"
+		ls.Parent = player
+	end
+	if not ls then return nil end
+	local stat = ls:FindFirstChild(CURRENCY_PLURAL)
+		or ls:FindFirstChild(CURRENCY_NAME)
+		or ls:FindFirstChild("Sprigs")
+		or ls:FindFirstChild("Tokens")
+	if not stat and create then
+		stat = Instance.new("IntValue")
+		stat.Name = CURRENCY_PLURAL
+		stat.Parent = ls
+	end
+	return stat
+end
+
+local function publishBalance(player)
+	local d = walletData(player)
+	local value = math.max(math.floor(tonumber(d and d.cash) or 0), 0)
+	player:SetAttribute("Wallet", value)
+	local stat = currencyStat(player, true)
+	if stat and stat:IsA("ValueBase") then stat.Value = value end
+	return value
+end
+
+local function awardCurrency(player, amount)
+	amount = math.max(math.floor(tonumber(amount) or 0), 0)
+	local d = walletData(player)
+	if not d then return false end
+	d.cash = math.max(math.floor(tonumber(d.cash) or 0) + amount, 0)
+	markDirty(player)
+	publishBalance(player)
+	return true
+end
+
+local function spendCurrency(player, amount)
+	amount = math.max(math.floor(tonumber(amount) or 0), 0)
+	local d = walletData(player)
+	if not d then return false end
+	local have = math.max(math.floor(tonumber(d.cash) or 0), 0)
+	if have < amount then return false end
+	d.cash = have - amount
+	markDirty(player)
+	publishBalance(player)
+	return true
+end
+
+local function tokenBalance(player)
+	local d = walletData(player)
+	return math.max(math.floor(tonumber(d and d.cash) or 0), 0)
+end
+
+local function priceOf(itemName)
+	local t = findTemplate(itemName)
+	local p = t and t:GetAttribute("Price")
+	return (type(p) == "number" and p > 0) and math.floor(p) or 0
+end
+
+local slotAccessCache = {}
+local function maxSlots(player)
+	if PREMIUM_PASS_ID <= 0 then return BASE_SLOTS end
+	if slotAccessCache[player.UserId] == nil then
+		local owns = false
+		pcall(function()
+			owns = MarketplaceService:UserOwnsGamePassAsync(player.UserId, PREMIUM_PASS_ID)
+		end)
+		slotAccessCache[player.UserId] = owns
+	end
+	return slotAccessCache[player.UserId] and PREMIUM_SLOTS or BASE_SLOTS
+end
+
+local function buildInfo()
+	local info = {}
+	for i, plot in ipairs(plots) do
+		local owner = claims[i]
+		info[i] = { name = plot.Name, taken = owner ~= nil, owner = owner and owner.Name or nil }
+	end
+	return info
+end
+
+local function broadcast() infoRemote:FireAllClients(buildInfo()) end
+
+local function teleportToPlot(player, idx)
+	local plot, character = plots[idx], player.Character
+	if plot and character then character:PivotTo(plot.CFrame + Vector3.new(0, 6, 0)) end
+end
+
+local function roleOf(player, idx)
+	if claims[idx] == player then return "owner" end
+	return members[idx] and members[idx][player] or nil
+end
+
+local function canBuild(player, idx)
+	local r = roleOf(player, idx)
+	if r == "owner" or r == "roommate" then return true end
+	if BuildPermissions and plots[idx] then
+		local ok = BuildPermissions.CanBuild(player, plots[idx])
+		if ok then return true end
+	end
+	return false
+end
+
+local function plotContainsXZ(idx, x, z)
+	local plot = plots[idx]
+	local rel = plot.CFrame:PointToObjectSpace(Vector3.new(x, plot.Position.Y, z))
+	return math.abs(rel.X) <= plot.Size.X/2 + BOUNDS_MARGIN
+		and math.abs(rel.Z) <= plot.Size.Z/2 + BOUNDS_MARGIN
+end
+
+-- True only if ALL four XZ corners of an oriented box are on the plot
+local function boxWithinPlot(idx, boxCF, boxSize)
+	local hx, hz = boxSize.X / 2, boxSize.Z / 2
+	local corners = {
+		Vector3.new(hx, 0, hz), Vector3.new(hx, 0, -hz),
+		Vector3.new(-hx, 0, hz), Vector3.new(-hx, 0, -hz),
+	}
+	for _, off in ipairs(corners) do
+		local corner = (boxCF * CFrame.new(off)).Position
+		if not plotContainsXZ(idx, corner.X, corner.Z) then
+			return false
+		end
+	end
+	return true
+end
+
+local function plotAtXZ(x, z)
+	for i in ipairs(plots) do
+		if plotContainsXZ(i, x, z) then return i end
+	end
+	return nil
+end
+
+local function plotAtPosition(pos)
+	local idx = plotAtXZ(pos.X, pos.Z)
+	if not idx then return nil end
+	local topY = plots[idx].Position.Y + plots[idx].Size.Y / 2
+	-- allowed vertical band: basement floor to above 3rd story
+	if pos.Y < topY - WALL_HEIGHT - 6 or pos.Y > topY + WALL_HEIGHT * (MAX_LEVEL + 1) + 6 then
+		return nil
+	end
+	return idx
+end
+
+local function plotTopY(idx)
+	local plot = plots[idx]
+	return plot.Position.Y + plot.Size.Y / 2
+end
+
+local function levelBaseY(idx, level)
+	return plotTopY(idx) + level * WALL_HEIGHT
+end
+
+local function pushInv(player)
+	local d = playerData[player]
+	if d then
+		invRemote:FireClient(player, d.inv, tokenBalance(player))
+	end
+end
+
+local function pushPartyStatus(idx)
+	local owner = claims[idx]
+	if not owner then return end
+	local memberList = {}
+	for m, role in pairs(members[idx] or {}) do
+		table.insert(memberList, { name = m.Name, role = role })
+	end
+	local base = { cmd = "status", plotName = plots[idx].Name, members = memberList }
+	for m in pairs(members[idx] or {}) do
+		local p = table.clone(base); p.isOwner = false; p.myRole = members[idx][m]
+		partyRemote:FireClient(m, p)
+	end
+	local p = table.clone(base); p.isOwner = true; p.myRole = "owner"
+	partyRemote:FireClient(owner, p)
+end
+
+--------------------------------------------------------------------
+-- STRUCTURES
+--------------------------------------------------------------------
+local function applyStructStyle(model, mat, r, g, b, t)
+	local part = model and model.PrimaryPart
+	if not part then return end
+	if mat and ALLOWED_MATERIALS[tostring(mat)] then
+		part.Material = Enum.Material[tostring(mat)]
+	end
+	local rn, gn, bn = tonumber(r), tonumber(g), tonumber(b)
+	if rn and gn and bn then
+		part.Color = Color3.new(math.clamp(rn,0,1), math.clamp(gn,0,1), math.clamp(bn,0,1))
+	end
+	local tn = tonumber(t)
+	if tn then
+		part.Transparency = math.clamp(tn, 0, 0.9)
+	end
+end
+
+local function spawnStructure(idx, kind, size, worldCFrame, materialName, color, wedge)
+	local part = Instance.new(wedge and "WedgePart" or "Part")
+	part.Anchored = true
+	part.Size = size
+	part.CFrame = worldCFrame
+	part.Material = (materialName and ALLOWED_MATERIALS[materialName]) and Enum.Material[materialName] or Enum.Material.SmoothPlastic
+	if color then
+		part.Color = color
+	else
+		part.Color = (kind == "w") and WALL_COLOR or (kind == "r") and ROOF_COLOR or FLOOR_COLOR
+	end
+	part.Name = "Structure"
+
+	local model = Instance.new("Model")
+	model.Name = (kind == "w") and "__Wall" or (kind == "r") and "__Roof" or "__Floor"
+	model:SetAttribute("StructureKind", kind)
+	model:SetAttribute("PlotIndex", idx)
+	part.Parent = model
+	model.PrimaryPart = part
+	model.Parent = getItemFolder(idx)
+	return model
+end
+
+local STRUCT_KIND = { __Wall = "w", __Floor = "f", __Roof = "r", __Light = "l" }
+local LIGHT_COST = 150 -- what one light fitting costs
+
+--------------------------------------------------------------------
+-- WALL TRIM
+-- Trim is a PROPERTY of a wall (an attribute), not a separate object.
+-- That way when a door cuts a wall into pieces, or the wall is restored,
+-- the trim simply comes along - no orphaned strips left floating.
+--------------------------------------------------------------------
+local TRIM_STYLES = {
+	none      = false,
+	-- v9.1 TWO-SIDED WALLS: a full-height 0.06-stud skin on ONE face, with
+	-- its own material + colour. Only dual-painted walls pay for the extra
+	-- thin part, so thousands of plain walls cost nothing additional.
+	face      = { { h = "full", y = "bottom", out = 0.06, drop = 0.0 } },
+	brickbase = {
+		mat = "Brick",
+		{ h = 3.6,  y = "bottom", out = 0.42, drop = 0.0 },   -- the brick band
+		{ h = 0.35, y = "bottom", out = 0.55, drop = 3.6 },   -- capping course
+	},
+	stonebase = {
+		mat = "Cobblestone",
+		{ h = 4.0,  y = "bottom", out = 0.45, drop = 0.0 },
+		{ h = 0.4,  y = "bottom", out = 0.58, drop = 4.0 },
+	},
+	slatebase = {
+		mat = "Slate",
+		{ h = 3.0,  y = "bottom", out = 0.38, drop = 0.0 },
+		{ h = 0.3,  y = "bottom", out = 0.5,  drop = 3.0 },
+	},
+	fullbrick = { -- brick all the way up, with a cap at the top
+		mat = "Brick",
+		{ h = 7.4,  y = "bottom", out = 0.42, drop = 0.0 },
+		{ h = 0.4,  y = "top",    out = 0.55, drop = 0.0 },
+	},
+	baseboard = { { h = 0.9,  y = "bottom", out = 0.16, drop = 0.0 } },
+	crown     = { { h = 0.7,  y = "top",    out = 0.22, drop = 0.0 } },
+	both      = {
+		{ h = 0.9, y = "bottom", out = 0.16, drop = 0.0 },
+		{ h = 0.7, y = "top",    out = 0.22, drop = 0.0 },
+	},
+	panel     = { -- wainscoting: a low panel with a rail on top
+		{ h = 1.1,  y = "bottom", out = 0.18, drop = 0.0 },
+		{ h = 0.25, y = "bottom", out = 0.28, drop = 1.1 },
+	},
+	band      = { { h = 0.5, y = "top", out = 0.34, drop = 1.2 } }, -- belt course
+	timber    = {
+		{ h = 1.3, y = "bottom", out = 0.28, drop = 0.0 },
+		{ h = 1.0, y = "top",    out = 0.28, drop = 0.0 },
+	},
+}
+
+--------------------------------------------------------------------
+-- LIGHTS: a small fitting plus a real light source. Colour, brightness
+-- and range are all set by the player.
+--------------------------------------------------------------------
+local LIGHT_TYPES = { point = true, spot = true, glow = true }
+
+local function spawnLight(idx, cf, colour, brightness, range, kind, size)
+	kind = LIGHT_TYPES[kind] and kind or "point"
+	colour = colour or Color3.fromRGB(255, 236, 200)
+	brightness = math.clamp(tonumber(brightness) or 1.6, 0.2, 8)
+	range = math.clamp(tonumber(range) or 18, 4, 60)
+	size = math.clamp(tonumber(size) or 1, 0.4, 4)
+
+	local model = Instance.new("Model")
+	model.Name = "__Light"
+
+	local bulb = Instance.new("Part")
+	bulb.Name = "Structure"
+	bulb.Shape = Enum.PartType.Ball
+	bulb.Size = Vector3.one * size
+	bulb.CFrame = cf
+	bulb.Anchored = true
+	bulb.CanCollide = false
+	bulb.CanQuery = true
+	bulb.Material = Enum.Material.Neon
+	bulb.Color = colour
+	bulb.Parent = model
+	model.PrimaryPart = bulb
+
+	if kind ~= "glow" then
+		local src = Instance.new(kind == "spot" and "SpotLight" or "PointLight")
+		src.Color = colour
+		src.Brightness = brightness
+		src.Range = range
+		if kind == "spot" then
+			src.Angle = 90
+			src.Face = Enum.NormalId.Bottom
+		end
+		src.Parent = bulb
+	end
+
+	model:SetAttribute("LightKind", kind)
+	model:SetAttribute("LightBright", brightness)
+	model:SetAttribute("LightRange", range)
+	model:SetAttribute("LightSize", size)
+	model.Parent = getItemFolder(idx)
+	return model
+end
+
+local function clearTrim(model)
+	for _, child in ipairs(model:GetChildren()) do
+		if child:IsA("BasePart") and child.Name == "Trim" then
+			child:Destroy()
+		end
+	end
+end
+
+-- side: 1 or -1, which FACE of the wall gets the trim. Each face is
+-- independent, so you can run baseboards inside and timber outside.
+local function applyTrim(model, styleName, colour, side, materialName, transparency)
+	if not (model and model.PrimaryPart) then return end
+	side = (tonumber(side) or 1) >= 0 and 1 or -1
+	local style = TRIM_STYLES[styleName or "none"]
+
+	-- clear only the strips on THIS face; the other side keeps its own
+	for _, child in ipairs(model:GetChildren()) do
+		if child:IsA("BasePart") and child.Name == "Trim"
+			and child:GetAttribute("Side") == side then
+			child:Destroy()
+		end
+	end
+
+	-- remember each face separately
+	local key = (side == 1) and "TrimA" or "TrimB"
+	local colourKey = (side == 1) and "TrimColorA" or "TrimColorB"
+	local matKey = (side == 1) and "TrimMatA" or "TrimMatB"
+	local transKey = (side == 1) and "TrimTransA" or "TrimTransB"
+	model:SetAttribute(key, styleName)
+	if colour then model:SetAttribute(colourKey, colour) end
+	if materialName and ALLOWED_MATERIALS[materialName] then
+		model:SetAttribute(matKey, materialName)
+	end
+	if transparency then model:SetAttribute(transKey, math.clamp(transparency, 0, 0.9)) end
+	model:SetAttribute("Trim", styleName) -- legacy/simple lookups
+	if not style then return end
+
+	local wall = model.PrimaryPart
+	local T, H, L = wall.Size.X, wall.Size.Y, wall.Size.Z
+	local trimColour = colour or model:GetAttribute(colourKey)
+		or Color3.fromRGB(248, 248, 244)
+	local trimMat = materialName
+	if not (trimMat and ALLOWED_MATERIALS[trimMat]) then
+		trimMat = model:GetAttribute(matKey)
+	end
+	if not (trimMat and ALLOWED_MATERIALS[trimMat]) then
+		trimMat = style.mat -- the style's own look (brick base = brick)
+	end
+	if not (trimMat and ALLOWED_MATERIALS[trimMat]) then trimMat = "SmoothPlastic" end
+	local trimTrans = transparency or model:GetAttribute(transKey) or 0
+	-- Door/window cuts create a top segment and, for windows, a bottom
+	-- segment. These flags stop bottom trim from being rebuilt above a door
+	-- and stop crown trim from appearing underneath a window.
+	local allowBottom = model:GetAttribute("TrimAllowBottom") ~= false
+	local allowTop = model:GetAttribute("TrimAllowTop") ~= false
+
+	for _, band in ipairs(style) do -- numeric entries only; 'mat' is skipped
+		-- Full-height skins always apply: a door/window segment must keep its
+		-- face colour even where base/crown trim would be suppressed.
+		if band.h ~= "full"
+			and ((band.y == "bottom" and not allowBottom)
+				or (band.y == "top" and not allowTop)) then
+			continue
+		end
+		local bandH = (band.h == "full") and H or band.h
+		local strip = Instance.new("Part")
+		strip.Name = "Trim"
+		strip.Anchored = true
+		strip.CanCollide = false
+		strip.CanQuery = true -- so the eyedropper can sample the trim itself
+		strip.Material = Enum.Material[trimMat]
+		strip.Color = trimColour
+		strip.Transparency = math.clamp(trimTrans, 0, 0.9)
+		strip:SetAttribute("Side", side)
+		-- a thin board standing proud of ONE face only
+		strip.Size = Vector3.new(band.out, bandH, L)
+
+		local y
+		if band.y == "bottom" then
+			y = -H / 2 + bandH / 2 + band.drop
+		else
+			y = H / 2 - bandH / 2 - band.drop
+		end
+		strip.CFrame = wall.CFrame * CFrame.new(side * (T / 2 + band.out / 2), y, 0)
+		strip.Parent = model
+	end
+end
+
+-- rebuild both faces (used after a resize, or when copying a wall)
+local function reapplyTrim(model)
+	local a = model:GetAttribute("TrimA")
+	local b = model:GetAttribute("TrimB")
+	if a and a ~= "none" then
+		applyTrim(model, a, model:GetAttribute("TrimColorA"), 1,
+			model:GetAttribute("TrimMatA"), model:GetAttribute("TrimTransA"))
+	end
+	if b and b ~= "none" then
+		applyTrim(model, b, model:GetAttribute("TrimColorB"), -1,
+			model:GetAttribute("TrimMatB"), model:GetAttribute("TrimTransB"))
+	end
+end
+
+local KIND_NAME = { w = "__Wall", f = "__Floor", r = "__Roof", l = "__Light" }
+
+-- Floors/roofs may sit flush edge-to-edge but not overlap their own kind
+local function overlapsSameKind(idx, kind, boxCF, boxSize)
+	local wanted = KIND_NAME[kind]
+	local includes = {}
+	for _, m in ipairs(getItemFolder(idx):GetChildren()) do
+		if m:IsA("Model") and m.Name == wanted then
+			table.insert(includes, m)
+		end
+	end
+	if #includes == 0 then return false end
+	local params = OverlapParams.new()
+	params.FilterType = Enum.RaycastFilterType.Include
+	params.FilterDescendantsInstances = includes
+	local shrunk = Vector3.new(
+		math.max(boxSize.X - 0.4, 0.1),
+		math.max(boxSize.Y * 0.8, 0.1),
+		math.max(boxSize.Z - 0.4, 0.1)
+	)
+	return #workspace:GetPartBoundsInBox(boxCF, shrunk, params) > 0
+end
+
+--------------------------------------------------------------------
+-- WALL OPENINGS (shared by the door/window tools AND wall-fit items)
+--------------------------------------------------------------------
+local nextOpeningId = os.time() % 100000 -- unique across sessions
+
+local function cutOpening(idx, wallModel, zc, openBottom, openTop, W)
+	local part = wallModel.PrimaryPart
+	if not part then return false end
+	nextOpeningId += 1
+	local openingId = nextOpeningId
+	local T, H, L = part.Size.X, part.Size.Y, part.Size.Z
+	if L < W + 0.5 then return false end
+	zc = math.clamp(zc, -L/2 + W/2 + 0.1, L/2 - W/2 - 0.1)
+	-- v9.3: if either side piece would be a sliver (<0.4 studs), nudge the
+	-- opening inward so BOTH sides remain thick enough to spawn. This closes
+	-- the "missing wall chunk next to a door" gap.
+	local leftW  = (zc - W/2) + L/2
+	local rightW = L/2 - (zc + W/2)
+	if leftW < 0.4 then
+		zc = zc + (0.4 - leftW)
+	elseif rightW < 0.4 then
+		zc = zc - (0.4 - rightW)
+	end
+	zc = math.clamp(zc, -L/2 + W/2 + 0.1, L/2 - W/2 - 0.1)
+	openBottom = math.clamp(openBottom, 0, H - 0.5)
+	openTop = math.clamp(openTop, openBottom + 0.5, H)
+
+	local style = { part.Material.Name, part.Color, part.Transparency }
+	local wallCF = part.CFrame
+	local trimA = wallModel:GetAttribute("TrimA")
+	local trimB = wallModel:GetAttribute("TrimB")
+	local trimColourA = wallModel:GetAttribute("TrimColorA")
+	local trimColourB = wallModel:GetAttribute("TrimColorB")
+	local trimMatA = wallModel:GetAttribute("TrimMatA")
+	local trimMatB = wallModel:GetAttribute("TrimMatB")
+	local trimTransA = wallModel:GetAttribute("TrimTransA")
+	local trimTransB = wallModel:GetAttribute("TrimTransB")
+
+	local function segment(segH, localY, segL, localZ, allowBottom, allowTop)
+		if segH < 0.15 or segL < 0.15 then return end
+		local m = spawnStructure(idx, "w", Vector3.new(T, segH, segL),
+			wallCF * CFrame.new(0, localY, localZ), style[1], style[2])
+		if m then
+			m:SetAttribute("OpeningId", openingId) -- so we can undo this cut
+			m:SetAttribute("TrimAllowBottom", allowBottom ~= false)
+			m:SetAttribute("TrimAllowTop", allowTop ~= false)
+			if m.PrimaryPart then m.PrimaryPart.Transparency = style[3] end
+			-- Carry each face independently, but only on the vertical region
+			-- it occupied before the opening was cut.
+			if trimA and trimA ~= "none" then
+				applyTrim(m, trimA, trimColourA, 1, trimMatA, trimTransA)
+			end
+			if trimB and trimB ~= "none" then
+				applyTrim(m, trimB, trimColourB, -1, trimMatB, trimTransB)
+			end
+		end
+	end
+
+	-- Full-height side pieces retain both base and crown trim.
+	segment(H, 0, (zc - W/2) + L/2, (-L/2 + (zc - W/2)) / 2, true, true)
+	segment(H, 0, L/2 - (zc + W/2), ((zc + W/2) + L/2) / 2, true, true)
+	-- The piece over a door/window may retain crown trim, never base trim.
+	segment(H - openTop, -H/2 + openTop + (H - openTop)/2, W, zc, false, true)
+	if openBottom > 0.15 then
+		-- The piece under a window may retain base trim, never crown trim.
+		segment(openBottom, -H/2 + openBottom/2, W, zc, true, false)
+	end
+
+	local original = {
+		size = part.Size,
+		cf = part.CFrame,
+		mat = part.Material.Name,
+		color = part.Color,
+		transparency = part.Transparency,
+		trimA = trimA, trimB = trimB,
+		trimColorA = trimColourA, trimColorB = trimColourB,
+		trimMatA = trimMatA, trimMatB = trimMatB,
+		trimTransA = trimTransA, trimTransB = trimTransB,
+	}
+	wallModel:Destroy()
+	return true, openingId, original
+end
+
+-- Pick the BEST wall at a point: nearest to the click plane and long
+-- enough for the item. Walls chopped up by earlier doors leave short
+-- stubs, and grabbing one of those is what made placement "confused".
+-- Put a wall back exactly as it was before a door/window cut it. Used by
+-- BOTH removing and selling, so either route leaves a clean wall.
+local function restoreWallFor(model, idx)
+	local openingId = model:GetAttribute("OpeningId")
+	local wallCF = model:GetAttribute("WallCF")
+	local wallSize = model:GetAttribute("WallSize")
+	if not (openingId and typeof(wallCF) == "CFrame" and typeof(wallSize) == "Vector3") then
+		if model:GetAttribute("OpenSize") or model:GetAttribute("OpenCF") then
+			warn("[Wall] '" .. model.Name .. "' was placed before the revert system "
+				.. "existed - remove it, patch the gap once, then re-place it.")
+		end
+		return false
+	end
+
+	-- Leave it alone only if another DOOR/WINDOW still occupies this
+	-- opening. The wall segments carry the same OpeningId, so they must be
+	-- excluded here - counting them was what stopped the wall ever
+	-- being restored.
+	for _, other in ipairs(getItemFolder(idx):GetChildren()) do
+		if other ~= model and other:IsA("Model")
+			and not STRUCT_KIND[other.Name]
+			and other:GetAttribute("OpeningId") == openingId then
+			return false
+		end
+	end
+
+	local removed = 0
+	for _, seg in ipairs(getItemFolder(idx):GetChildren()) do
+		if seg:IsA("Model") and seg.Name == "__Wall"
+			and seg:GetAttribute("OpeningId") == openingId then
+			seg:Destroy()
+			removed += 1
+		end
+	end
+
+	local restored = spawnStructure(idx, "w", wallSize, wallCF,
+		model:GetAttribute("WallMat"), model:GetAttribute("WallColor"))
+	if restored and restored.PrimaryPart then
+		local t = tonumber(model:GetAttribute("WallT"))
+		if t then restored.PrimaryPart.Transparency = math.clamp(t, 0, 0.9) end
+		local ta = model:GetAttribute("WallTrimA")
+		local tb = model:GetAttribute("WallTrimB")
+		if ta and ta ~= "none" then
+			applyTrim(restored, ta, model:GetAttribute("WallTrimColorA"), 1,
+				model:GetAttribute("WallTrimMatA"), model:GetAttribute("WallTrimTransA"))
+		end
+		if tb and tb ~= "none" then
+			applyTrim(restored, tb, model:GetAttribute("WallTrimColorB"), -1,
+				model:GetAttribute("WallTrimMatB"), model:GetAttribute("WallTrimTransB"))
+		end
+	end
+	print("[Wall] restored the original wall for " .. model.Name
+		.. " (removed " .. removed .. " cut piece(s))")
+	return true
+end
+
+local function wallAtPosition(idx, pos, minLength)
+	local best, bestRel, bestDist = nil, nil, math.huge
+	for _, m in ipairs(getItemFolder(idx):GetChildren()) do
+		if m:IsA("Model") and m.Name == "__Wall" and m.PrimaryPart then
+			local part = m.PrimaryPart
+			local rel = part.CFrame:PointToObjectSpace(pos)
+			local inside = math.abs(rel.X) <= part.Size.X/2 + 1.5
+				and math.abs(rel.Y) <= part.Size.Y/2 + 0.5
+				and math.abs(rel.Z) <= part.Size.Z/2
+			local longEnough = (not minLength) or (part.Size.Z >= minLength + 0.5)
+			if inside and longEnough then
+				local dist = math.abs(rel.X)
+				if dist < bestDist then
+					best, bestRel, bestDist = m, rel, dist
+				end
+			end
+		end
+	end
+	return best, bestRel
+end
+
+local function wallItemKind(template)
+	local attr = template:GetAttribute("WallItem")
+	if attr == "door" or attr == "window" then return attr end
+	local parent = template.Parent
+	if parent and parent:IsA("Folder") then
+		local n = parent.Name:lower()
+		if n == "doors" then return "door" end
+		if n == "windows" then return "window" end
+	end
+	return nil
+end
+
+--------------------------------------------------------------------
+-- PERSISTENCE
+--------------------------------------------------------------------
+local function serializePlot(idx)
+	local plot, folder = plots[idx], plotItemFolders[idx]
+	if not (plot and folder) then return {} end
+	local data = {}
+	for _, model in ipairs(folder:GetChildren()) do
+		if model:IsA("Model") then
+			local pivot = model:GetPivot()
+			local rel = plot.CFrame:ToObjectSpace(pivot)
+			local rxO, ry, rzO = rel:ToOrientation()
+			local kind = STRUCT_KIND[model.Name]
+			if kind then
+				local part = model.PrimaryPart
+				if part then
+					local srx, sry, srz = plot.CFrame:ToObjectSpace(part.CFrame):ToOrientation()
+					local ca = model:GetAttribute("TrimColorA")
+					local cb = model:GetAttribute("TrimColorB")
+					table.insert(data, {
+						k = kind,
+						oid = model:GetAttribute("OpeningId"),
+						tra = model:GetAttribute("TrimA"),
+						trb = model:GetAttribute("TrimB"),
+						tca = ca and { ca.R, ca.G, ca.B } or nil,
+						tcb2 = cb and { cb.R, cb.G, cb.B } or nil,
+						tma = model:GetAttribute("TrimMatA"),
+						tmb = model:GetAttribute("TrimMatB"),
+						tta = model:GetAttribute("TrimTransA"),
+						ttb = model:GetAttribute("TrimTransB"),
+						sx = part.Size.X, sy = part.Size.Y, sz = part.Size.Z,
+						x = rel.Position.X, y = rel.Position.Y, z = rel.Position.Z, r = sry,
+						rx = (math.abs(srx) > 0.01) and srx or nil,
+						rz = (math.abs(srz) > 0.01) and srz or nil,
+						m = part.Material.Name,
+						c = { part.Color.R, part.Color.G, part.Color.B },
+						t = part.Transparency,
+						wd = part:IsA("WedgePart") and 1 or nil,
+					})
+				end
+			else
+				local scale = 1
+				pcall(function() scale = model:GetScale() end)
+				local entry = {
+					n = model.Name,
+					x = rel.Position.X, y = rel.Position.Y, z = rel.Position.Z, r = ry,
+					rx = (math.abs(rxO) > 0.01) and rxO or nil,
+					rz = (math.abs(rzO) > 0.01) and rzO or nil,
+					s = scale,
+				}
+				-- persist the wall-opening record (healing works even
+				-- after a rejoin/slot swap)
+				local wSize = model:GetAttribute("WallSize")
+				local wCF = model:GetAttribute("WallCF")
+				if typeof(wSize) == "Vector3" and typeof(wCF) == "CFrame" then
+					local wrel = plot.CFrame:ToObjectSpace(wCF)
+					local wrx, wry, wrz = wrel:ToOrientation()
+					local wc = model:GetAttribute("WallColor")
+					entry.op = {
+						wrel.Position.X, wrel.Position.Y, wrel.Position.Z, wry,
+						wSize.X, wSize.Y, wSize.Z,
+						tostring(model:GetAttribute("WallMat") or "SmoothPlastic"),
+						wc and wc.R or 1, wc and wc.G or 1, wc and wc.B or 1,
+						tonumber(model:GetAttribute("WallT")) or 0,
+						tonumber(model:GetAttribute("OpeningId")) or 0,
+						wrx, wrz,
+					}
+				end
+
+				-- persist per-part paint jobs (index-ordered)
+				if model:GetAttribute("Painted") then
+					local pc = {}
+					for _, part in ipairs(model:GetDescendants()) do
+						if part:IsA("BasePart") then
+							table.insert(pc, {
+								part.Color.R, part.Color.G, part.Color.B,
+								part.Material.Name, part.Transparency,
+							})
+						end
+					end
+					entry.pc = pc
+				end
+				table.insert(data, entry)
+			end
+		end
+	end
+	return data
+end
+
+local function spawnItem(idx, itemName, worldCFrame, scale)
+	local template = findTemplate(itemName)
+	if not template then return nil end
+	if not ensurePrimaryPart(template) then return nil end
+	local item = template:Clone()
+	ensurePrimaryPart(item)
+	if scale and scale ~= 1 then
+		pcall(function() item:ScaleTo(math.clamp(scale, SCALE_MIN, SCALE_MAX)) end)
+	end
+	item:PivotTo(worldCFrame)
+	for _, part in ipairs(item:GetDescendants()) do
+		if part:IsA("BasePart") then
+			part.Anchored = true
+			part.CanQuery = true -- guarantees select/remove can target it
+		end
+	end
+	item:SetAttribute("PlotIndex", idx)
+	item.Parent = getItemFolder(idx)
+	return item
+end
+
+local function rebuildEntry(idx, e)
+	local plot = plots[idx]
+	local rel = CFrame.new(e.x or 0, e.y or 0, e.z or 0)
+		* CFrame.fromOrientation(e.rx or 0, e.r or 0, e.rz or 0)
+	local worldCF = plot.CFrame:ToWorldSpace(rel)
+	if e.k == "l" then
+		-- rebuild a light exactly as it was
+		local lc = (type(e.lc) == "table") and Color3.new(e.lc[1], e.lc[2], e.lc[3]) or nil
+		spawnLight(idx, worldCF, lc, e.lb, e.lr, e.lk, e.ls)
+	elseif e.k then
+		local color = (type(e.c) == "table") and Color3.new(e.c[1] or 1, e.c[2] or 1, e.c[3] or 1) or nil
+		local m = spawnStructure(idx, e.k, Vector3.new(e.sx or 1, e.sy or 1, e.sz or 1), worldCF, e.m, color, e.wd == 1)
+		if m then
+			if e.t then applyStructStyle(m, nil, nil, nil, nil, e.t) end
+			if e.oid then m:SetAttribute("OpeningId", e.oid) end
+			if e.tra and e.tra ~= "none" then
+				local ca = e.tca and Color3.new(e.tca[1], e.tca[2], e.tca[3]) or nil
+				applyTrim(m, e.tra, ca, 1, e.tma, e.tta)
+			end
+			if e.trb and e.trb ~= "none" then
+				local cb = e.tcb2 and Color3.new(e.tcb2[1], e.tcb2[2], e.tcb2[3]) or nil
+				applyTrim(m, e.trb, cb, -1, e.tmb, e.ttb)
+			end
+		end
+	elseif type(e.n) == "string" then
+		local furnRel = CFrame.new(e.x or 0, e.y or 0, e.z or 0)
+			* CFrame.fromOrientation(e.rx or 0, e.r or 0, e.rz or 0)
+		local item = spawnItem(idx, e.n, plot.CFrame:ToWorldSpace(furnRel), e.s)
+		if item and type(e.op) == "table" and #e.op >= 12 then
+			local wrel = CFrame.new(e.op[1], e.op[2], e.op[3])
+				* CFrame.fromOrientation(e.op[14] or 0, e.op[4], e.op[15] or 0)
+			item:SetAttribute("WallCF", plot.CFrame:ToWorldSpace(wrel))
+			item:SetAttribute("WallSize", Vector3.new(e.op[5], e.op[6], e.op[7]))
+			item:SetAttribute("WallMat", e.op[8])
+			item:SetAttribute("WallColor", Color3.new(e.op[9], e.op[10], e.op[11]))
+			item:SetAttribute("WallT", e.op[12])
+			item:SetAttribute("OpeningId", e.op[13] or 0)
+		end
+		if item and type(e.pc) == "table" then
+			item:SetAttribute("Painted", true)
+			local i = 0
+			for _, part in ipairs(item:GetDescendants()) do
+				if part:IsA("BasePart") then
+					i += 1
+					local p = e.pc[i]
+					if type(p) == "table" then
+						part.Color = Color3.new(p[1] or 1, p[2] or 1, p[3] or 1)
+						if p[4] and ALLOWED_MATERIALS[p[4]] then
+							part.Material = Enum.Material[p[4]]
+						end
+						if tonumber(p[5]) then
+							part.Transparency = math.clamp(p[5], 0, 0.9)
+						end
+					end
+				end
+			end
+		end
+	end
+end
+
+local function loadData(player)
+	task.spawn(function()
+		local data
+		local ok, err = pcall(function()
+			data = store:GetAsync("Player_" .. player.UserId)
+		end)
+		local d = playerData[player]
+		if not d then return end
+		if ok then
+			d.loaded = true
+			if data == nil then
+				d.cash = STARTING_CASH -- first time here: give them a float
+			end
+		else
+			warn("[PlotSave] " .. player.Name .. ": LOAD FAILED - " .. tostring(err)
+				.. " (saving is disabled for this session to protect existing data)")
+		end
+		if ok and type(data) == "table" then
+			d.cash = tonumber(data.cash) or 0
+			d.inv = (type(data.inv) == "table") and data.inv or {}
+			if type(data.slots) == "table" then
+				d.slots = data.slots
+				d.cur = math.clamp(math.floor(tonumber(data.cur) or 1), 1, PREMIUM_SLOTS)
+			elseif type(data.placed) == "table" then
+				d.slots = { [1] = data.placed } -- migrate old single-layout saves
+				d.cur = 1
+			end
+		end
+		pushInv(player)
+		publishBalance(player)
+		local total = 0
+		for _, slot in pairs(d.slots) do total += #slot end
+		print("[PlotSave] " .. player.Name .. ": loaded " .. total
+			.. " saved objects across " .. #d.slots .. " slot(s), active slot " .. d.cur)
+		local idx = playerPlot[player]
+		if idx and not d.spawned then
+			d.spawned = true
+			for _, e in ipairs(d.slots[d.cur] or {}) do
+				if #getItemFolder(idx):GetChildren() >= MAX_ITEMS then break end
+				rebuildEntry(idx, e)
+			end
+		end
+	end)
+end
+
+local function saveData(player, reason)
+	local d = playerData[player]
+	if not d then
+		warn("[PlotSave] " .. player.Name .. ": no data table - nothing saved")
+		return
+	end
+	if not d.loaded then
+		warn("[PlotSave] " .. player.Name .. ": save SKIPPED because their data "
+			.. "never loaded (DataStore unavailable? check Studio API access)")
+		return
+	end
+	local idx = playerPlot[player]
+	if idx then
+		d.slots[d.cur] = serializePlot(idx)
+	end
+	local count = idx and #(d.slots[d.cur] or {}) or 0
+	local ok, err = pcall(function()
+		store:SetAsync("Player_" .. player.UserId, { inv = d.inv, cur = d.cur, slots = d.slots, cash = d.cash })
+	end)
+	if ok then
+		print("[PlotSave] " .. player.Name .. ": saved " .. count .. " objects to slot "
+			.. d.cur .. " (" .. (reason or "manual") .. ")")
+		player:SetAttribute("LastPlotSave", os.clock()) -- client shows a toast
+	else
+		warn("[PlotSave] " .. player.Name .. ": SAVE FAILED - " .. tostring(err))
+	end
+end
+
+--------------------------------------------------------------------
+-- PERMISSION BRIDGE (door/window scripts ask this who may open/lock)
+--------------------------------------------------------------------
+-- lets other server scripts (e.g. the admin panel) top up the built-in
+-- wallet without knowing how it's stored
+local walletBridge = ServerScriptService:FindFirstChild("PlotWalletBridge")
+if walletBridge and not walletBridge:IsA("BindableFunction") then walletBridge:Destroy(); walletBridge = nil end
+if not walletBridge then
+	walletBridge = Instance.new("BindableFunction")
+	walletBridge.Name = "PlotWalletBridge"
+	walletBridge.Parent = ServerScriptService
+end
+walletBridge.OnInvoke = function(player, request)
+	if typeof(player) ~= "Instance" or not player:IsA("Player") then return false, "Bad player" end
+	local d = playerData[player]
+	if not d then return false, "Wallet is still loading" end
+
+	-- Backward compatible: bridge:Invoke(player, 500) means add 500.
+	local action, amount
+	if type(request) == "table" then
+		action = tostring(request.action or request.cmd or "get"):lower()
+		amount = tonumber(request.amount) or 0
+	else
+		action = "add"
+		amount = tonumber(request) or 0
+	end
+	amount = math.floor(amount)
+
+	if action == "get" or action == "check" then
+		return true, tokenBalance(player)
+	elseif action == "add" or action == "give" or action == "award" then
+		return awardCurrency(player, math.max(amount, 0)), tokenBalance(player)
+	elseif action == "spend" or action == "take" then
+		local ok = spendCurrency(player, math.max(amount, 0))
+		return ok, tokenBalance(player)
+	elseif action == "set" then
+		d.cash = math.max(amount, 0)
+		markDirty(player)
+		publishBalance(player)
+		return true, tokenBalance(player)
+	elseif action == "topup" then
+		local target = math.max(amount, 0)
+		if tokenBalance(player) < target then d.cash = target end
+		markDirty(player)
+		publishBalance(player)
+		return true, tokenBalance(player)
+	end
+	return false, "Unknown wallet action"
+end
+
+local permission = Instance.new("BindableFunction")
+permission.Name = "PlotPermission"
+permission.Parent = ServerScriptService
+permission.OnInvoke = function(plotIndex, userId)
+	plotIndex = tonumber(plotIndex)
+	if not (plotIndex and plots[plotIndex]) then return nil end
+	local owner = claims[plotIndex]
+	if not owner then return nil end
+	if owner.UserId == userId then return "owner" end
+	for m, role in pairs(members[plotIndex] or {}) do
+		if m.UserId == userId then return role end
+	end
+	return nil
+end
+
+--------------------------------------------------------------------
+-- CLAIMS
+--------------------------------------------------------------------
+claimRemote.OnServerInvoke = function(player, plotIndex)
+	if plotIndex == "info" then return buildInfo() end
+	if type(plotIndex) ~= "number" or not plots[plotIndex] then return false, "Invalid plot" end
+	if playerPlot[player] then return false, "You already have a plot" end
+	if claims[plotIndex] then return false, "Plot already taken" end
+
+	claims[plotIndex] = player
+	playerPlot[player] = plotIndex
+	members[plotIndex] = {}
+	plots[plotIndex]:SetAttribute("OwnerUserId", player.UserId)
+	plots[plotIndex]:SetAttribute("AllowTeamBuild", true)
+	plots[plotIndex]:SetAttribute("OwnerTeamName", player.Team and player.Team.Name or "")
+	if BuildPermissions then
+		pcall(BuildPermissions.InitializePlot, plots[plotIndex], player, true)
+	end
+	broadcast()
+	teleportToPlot(player, plotIndex)
+	pushPartyStatus(plotIndex)
+
+	local d = playerData[player]
+	if d and d.loaded and not d.spawned then
+		d.spawned = true
+		for _, e in ipairs(d.slots[d.cur] or {}) do
+			rebuildEntry(plotIndex, e)
+		end
+	end
+	return true, plots[plotIndex].Name
+end
+
+--------------------------------------------------------------------
+-- PARTY / ROLES
+--------------------------------------------------------------------
+partyRemote.OnServerEvent:Connect(function(player, payload)
+	if type(payload) ~= "table" or type(payload.cmd) ~= "string" then return end
+	local cmd = payload.cmd
+
+	if cmd == "invite" then
+		local idx = playerPlot[player]
+		if not idx then return end
+		local target = Players:FindFirstChild(tostring(payload.target))
+		if not target or target == player or roleOf(target, idx) then return end
+		pendingInvites[target] = pendingInvites[target] or {}
+		pendingInvites[target][player] = idx
+		partyRemote:FireClient(target, { cmd = "invite", from = player.Name, plotName = plots[idx].Name })
+
+	elseif cmd == "respond" then
+		local inviter = Players:FindFirstChild(tostring(payload.from))
+		local invites = pendingInvites[player]
+		if not (inviter and invites and invites[inviter]) then return end
+		local idx = invites[inviter]
+		invites[inviter] = nil
+		if payload.accept == true and claims[idx] == inviter then
+			members[idx][player] = "guest"
+
+			-- Joining is instant, but the TELEPORT is rate-limited so
+			-- invites can't be used to hop around the map at will.
+			local now = os.clock()
+			local last = lastTeleport[player]
+			if last and (now - last) < TELEPORT_COOLDOWN then
+				local wait = math.ceil(TELEPORT_COOLDOWN - (now - last))
+				partyRemote:FireClient(player, {
+					cmd = "notice",
+					text = "Joined the household. You can teleport again in "
+						.. wait .. "s - walk over for now.",
+				})
+			else
+				lastTeleport[player] = now
+				teleportToPlot(player, idx)
+			end
+			pushPartyStatus(idx)
+		end
+
+	elseif cmd == "setRole" then
+		local idx = playerPlot[player]
+		if not idx then return end
+		local target = Players:FindFirstChild(tostring(payload.target))
+		local role = payload.role
+		if target and members[idx] and members[idx][target]
+			and (role == "guest" or role == "roommate") then
+			members[idx][target] = role
+			pushPartyStatus(idx)
+		end
+
+	elseif cmd == "kick" then
+		local idx = playerPlot[player]
+		if not idx then return end
+		local target = Players:FindFirstChild(tostring(payload.target))
+		if target and members[idx] and members[idx][target] then
+			members[idx][target] = nil
+			partyRemote:FireClient(target, { cmd = "kicked", plotName = plots[idx].Name })
+			pushPartyStatus(idx)
+		end
+
+	elseif cmd == "status" then
+		local idx = playerPlot[player]
+		if idx then
+			pushPartyStatus(idx)
+		else
+			for i in pairs(claims) do
+				if members[i] and members[i][player] then pushPartyStatus(i) break end
+			end
+		end
+	end
+end)
+
+--------------------------------------------------------------------
+-- BUILD ACTIONS
+--------------------------------------------------------------------
+local function resolvePlacedModel(target)
+	if typeof(target) ~= "Instance" then return nil end
+	local model = target
+	while model and model.Parent and not (model.Parent.Parent == itemsRoot) do
+		model = model.Parent
+	end
+	if model and model.Parent and model.Parent.Parent == itemsRoot then
+		local idx = tonumber(model.Parent.Name:match("%d+"))
+		return model, idx
+	end
+	return nil
+end
+
+local CHANGE_ACTIONS = {
+	place = true, remove = true, wall = true, floor = true, roof = true,
+	transform = true, resize = true, paint = true, clone = true,
+	cutout = true, bulldoze = true, loadslot = true,
+}
+
+buildRemote.OnServerInvoke = function(player, payload)
+	if type(payload) ~= "table" or type(payload.action) ~= "string" then return false, "Bad request" end
+	if CHANGE_ACTIONS[payload.action] then
+		task.defer(markDirty, player) -- schedule an autosave after this change
+	end
+	local d = playerData[player]
+	local action = payload.action
+
+	----------------------------------------------------------------
+	if action == "place" then
+		if type(payload.x) ~= "number" or type(payload.y) ~= "number"
+			or type(payload.z) ~= "number" or type(payload.rot) ~= "number" then
+			return false, "Bad position"
+		end
+		local pos = Vector3.new(payload.x, payload.y, payload.z)
+		local idx = plotAtPosition(pos)
+		if not idx then return false, "Outside any plot" end
+		if not canBuild(player, idx) then return false, "Roommates only!" end
+		if #getItemFolder(idx):GetChildren() >= MAX_ITEMS then return false, "Item limit reached" end
+
+		local itemName = tostring(payload.item)
+		local template = findTemplate(itemName)
+		if not template then return false, "Unknown item" end
+
+		------------------------------------------------------------
+		-- WALL-FIT ITEMS (doors/windows): the wall carves itself to
+		-- the model's size, then the model sits in the opening
+		------------------------------------------------------------
+		local wKind = wallItemKind(template)
+		if wKind then
+			local _, tSizePre = template:GetBoundingBox()
+			local needed = math.max(tSizePre.X, tSizePre.Z) + 0.02
+			local wallModel, relHit = wallAtPosition(idx, pos, needed)
+			if not wallModel then
+				return false, "No wall here big enough for that"
+			end
+			local wallPart = wallModel.PrimaryPart
+			local wallCF, H = wallPart.CFrame, wallPart.Size.Y
+			local _, tSize = template:GetBoundingBox()
+
+			-- exact fit: the wall hugs the model instead of leaving gaps
+			local W = math.min(math.max(tSize.X, tSize.Z) + 0.02, wallPart.Size.Z - 0.2)
+			local itemH = tSize.Y
+			local openBottom, openTop
+			if wKind == "door" then
+				openBottom = 0
+				openTop = math.min(itemH + 0.02, H)
+			else
+				local clickBottom = (relHit.Y + H/2) - itemH/2
+				openBottom = math.clamp(clickBottom, 0.2, math.max(H - itemH - 0.05, 0.2))
+				openTop = math.min(openBottom + itemH + 0.02, H)
+			end
+
+			local zc = math.clamp(relHit.Z, -wallPart.Size.Z/2 + W/2 + 0.1, wallPart.Size.Z/2 - W/2 - 0.1)
+			local wallBottomY = wallPart.Position.Y - H/2
+
+			-- capture the wall's style + opening geometry BEFORE the cut,
+			-- so removing the item later can HEAL the hole
+			local healMat = wallPart.Material.Name
+			local healColor = wallPart.Color
+			local healT = wallPart.Transparency
+			local healSize = Vector3.new(wallPart.Size.X, openTop - openBottom, W)
+			local healCF = wallCF * CFrame.new(0, -H/2 + (openBottom + openTop)/2, zc)
+
+			-- pay first (same rules as normal placement)
+			if not d then return false, "Still loading..." end
+			local ownedW = d.inv[itemName] or 0
+			if ownedW > 0 then
+				d.inv[itemName] = ownedW - 1
+				if d.inv[itemName] <= 0 then d.inv[itemName] = nil end
+			else
+				local price = priceOf(itemName)
+				if price > 0 then
+					if not spendCurrency(player, price) then
+						return false, "Not enough " .. CURRENCY_PLURAL .. "! (" .. price .. ")"
+					end
+				end
+			end
+			pushInv(player)
+
+			local cutOk, openingId, original = cutOpening(idx, wallModel, zc, openBottom, openTop, W)
+			if not cutOk then
+				return false, "Wall too short for that item"
+			end
+
+			-- seat the item centered in the wall plane, facing the wall's way
+			local itemPos = wallCF * CFrame.new(0, 0, zc)
+			local tCF2, tSize2 = template:GetBoundingBox()
+			local bottomDelta = template:GetPivot().Position.Y - (tCF2.Position.Y - tSize2.Y/2)
+			local itemY = wallBottomY + openBottom + bottomDelta
+			local yaw = math.rad(WALL_ITEM_YAW) + (payload.flip and math.pi or 0)
+			local finalCF = CFrame.new(itemPos.Position.X, itemY, itemPos.Position.Z)
+				* wallCF.Rotation * CFrame.Angles(0, yaw, 0)
+			local item = spawnItem(idx, itemName, finalCF)
+			if item then
+				item:SetAttribute("PlacedBy", player.UserId)
+				-- (returned below so the client can offer Undo)
+				-- UNDO RECORD: removing this item deletes the segments the
+				-- cut created and restores the ORIGINAL wall exactly, rather
+				-- than patching the hole with an extra block
+				item:SetAttribute("OpeningId", openingId)
+				item:SetAttribute("WallCF", original.cf)
+				item:SetAttribute("WallSize", original.size)
+				item:SetAttribute("WallMat", original.mat)
+				item:SetAttribute("WallColor", original.color)
+				item:SetAttribute("WallT", original.transparency)
+				if original.trimA then item:SetAttribute("WallTrimA", original.trimA) end
+				if original.trimB then item:SetAttribute("WallTrimB", original.trimB) end
+				if original.trimColorA then item:SetAttribute("WallTrimColorA", original.trimColorA) end
+				if original.trimColorB then item:SetAttribute("WallTrimColorB", original.trimColorB) end
+				if original.trimMatA then item:SetAttribute("WallTrimMatA", original.trimMatA) end
+				if original.trimMatB then item:SetAttribute("WallTrimMatB", original.trimMatB) end
+				if original.trimTransA then item:SetAttribute("WallTrimTransA", original.trimTransA) end
+				if original.trimTransB then item:SetAttribute("WallTrimTransB", original.trimTransB) end
+				return true, item
+			end
+			return false, "Placement failed"
+		end
+
+		local snapped = Vector3.new(math.round(pos.X/GRID)*GRID, pos.Y, math.round(pos.Z/GRID)*GRID)
+		local rot = math.rad(math.round(math.deg(payload.rot) / 90) * 90)
+		local placeCF = CFrame.new(snapped) * CFrame.Angles(0, rot, 0)
+
+		local tCF, tSize = template:GetBoundingBox()
+		local pivotToBox = template:GetPivot():ToObjectSpace(tCF)
+		-- Overlap rule applies to FURNITURE ONLY: walls/floors/roofs are
+		-- meant to touch things (and have things placed on them)
+		local furnitureOnly = {}
+		for _, m in ipairs(getItemFolder(idx):GetChildren()) do
+			if m:IsA("Model") and not STRUCT_KIND[m.Name] then
+				table.insert(furnitureOnly, m)
+			end
+		end
+		if #furnitureOnly > 0 then
+			local params = OverlapParams.new()
+			params.FilterType = Enum.RaycastFilterType.Include
+			params.FilterDescendantsInstances = furnitureOnly
+			if #workspace:GetPartBoundsInBox(placeCF * pivotToBox, tSize * 0.85, params) > 0 then
+				return false, "Too close to another item!"
+			end
+		end
+		if not boxWithinPlot(idx, placeCF * pivotToBox, tSize) then
+			return false, "Keep it inside your plot!"
+		end
+
+		------------------------------------------------------------
+		-- STOCK RULE: every placement consumes one from your inventory.
+		-- If you don't own one, we buy it on the spot (so nothing is ever
+		-- free unless its Price is 0). This is what keeps the shop, your
+		-- owned counts and the world in sync.
+		------------------------------------------------------------
+		if not d then return false, "Still loading..." end
+		local owned = d.inv[itemName] or 0
+		if owned > 0 then
+			d.inv[itemName] = owned - 1
+			if d.inv[itemName] <= 0 then d.inv[itemName] = nil end
+		else
+			local price = priceOf(itemName)
+			if price > 0 then
+				if not spendCurrency(player, price) then
+					return false, "Not enough " .. CURRENCY_PLURAL .. "! (" .. price .. ")"
+				end
+			end
+			-- bought and placed in one motion: nothing to add to the bag
+		end
+		pushInv(player)
+
+		local item = spawnItem(idx, itemName, placeCF)
+		if not item then
+			-- stock is always consumed now, so always hand it back on failure
+			if d then
+				d.inv[itemName] = (d.inv[itemName] or 0) + 1
+				pushInv(player)
+			end
+			return false, "Placement failed"
+		end
+		item:SetAttribute("PlacedBy", player.UserId)
+		return true, item
+
+		----------------------------------------------------------------
+	elseif action == "remove" then
+		local model, idx = resolvePlacedModel(payload.target)
+		if not model then return false, "Not a placed item" end
+		if not (idx and canBuild(player, idx)) then return false, "Roommates only!" end
+
+		restoreWallFor(model, idx)
+
+		if not STRUCT_KIND[model.Name] then
+			local owner = claims[idx]
+			local od = owner and playerData[owner]
+			if od then
+				od.inv[model.Name] = (od.inv[model.Name] or 0) + 1
+				pushInv(owner)
+			end
+		end
+		model:Destroy()
+		return true
+
+		----------------------------------------------------------------
+	elseif action == "canbuild" then -- "am I allowed to build right here?"
+		local character = player.Character
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		if not root then return false, "No character" end
+		local idx = plotAtXZ(root.Position.X, root.Position.Z)
+		if not idx then
+			return false, "Go to your plot to build"
+		end
+		if not canBuild(player, idx) then
+			local owner = claims[idx]
+			if owner then
+				return false, "This is " .. owner.Name .. "'s plot - ask to join their household"
+			end
+			return false, "This plot is unclaimed"
+		end
+		return true, plots[idx].Name
+
+		----------------------------------------------------------------
+	elseif action == "shop" then -- everything the shop needs in one call
+		local list = {}
+		if furnitureFolder then
+			for _, child in ipairs(furnitureFolder:GetChildren()) do
+				if child:IsA("Folder") then
+					for _, m in ipairs(child:GetChildren()) do
+						if m:IsA("Model") then
+							table.insert(list, { name = m.Name, category = child.Name, price = priceOf(m.Name) })
+						end
+					end
+				elseif child:IsA("Model") then
+					table.insert(list, { name = child.Name, category = "Misc", price = priceOf(child.Name) })
+				end
+			end
+		end
+		return true, { items = list, balance = tokenBalance(player), owned = d and d.inv or {} }
+
+		----------------------------------------------------------------
+	elseif action == "buy" then -- purchase into the inventory
+		if not d then return false, "Still loading..." end
+		local itemName = tostring(payload.item)
+		local template = findTemplate(itemName)
+		if not template then return false, "That item doesn't exist" end
+		local qty = math.clamp(math.floor(tonumber(payload.qty) or 1), 1, 10)
+		local price = priceOf(itemName) * qty
+
+		if price > 0 then
+			-- The canonical saved wallet is used by the shop, WalletUI and admin panel.
+			if not spendCurrency(player, price) then
+				return false, "Not enough " .. CURRENCY_PLURAL .. " (need " .. price .. ")"
+			end
+		end
+		d.inv[itemName] = (d.inv[itemName] or 0) + qty
+		pushInv(player)
+		return true, { balance = tokenBalance(player), owned = d.inv[itemName] }
+
+		----------------------------------------------------------------
+	elseif action == "homecatalog" then
+		-- Reserved for Brookhaven-style whole-home imports. Keeping the API
+		-- explicit now means templates can be added later without another UI rewrite.
+		return true, { wip = true, templates = {} }
+
+	elseif action == "importhome" then
+		return false, "Home importing is still being built"
+
+	elseif action == "sellplaced" then -- sell something already built
+		local model, idx = resolvePlacedModel(payload.target)
+		if not model then return false, "Not a placed item" end
+		if not (idx and canBuild(player, idx)) then return false, "Roommates only!" end
+		if STRUCT_KIND[model.Name] then
+			return false, "Walls and roofs can't be sold - use Delete"
+		end
+		local refund = math.floor(priceOf(model.Name) * SELL_REFUND)
+		restoreWallFor(model, idx) -- doors/windows put their wall back
+		model:Destroy()
+		if refund > 0 then
+			awardCurrency(player, refund)
+		end
+		pushInv(player)
+		return true, refund
+
+		----------------------------------------------------------------
+	elseif action == "sell" then
+		local itemName = tostring(payload.item)
+		if not (d and (d.inv[itemName] or 0) > 0) then return false, "Not in your inventory" end
+		local refund = math.floor(priceOf(itemName) * SELL_REFUND)
+		d.inv[itemName] -= 1
+		if d.inv[itemName] <= 0 then d.inv[itemName] = nil end
+		awardCurrency(player, refund)
+		pushInv(player)
+		return true, refund
+
+		----------------------------------------------------------------
+	elseif action == "wall" or action == "floor" or action == "roof" then
+		local ax, az = tonumber(payload.ax), tonumber(payload.az)
+		local bx, bz = tonumber(payload.bx), tonumber(payload.bz)
+		local level = math.clamp(math.floor(tonumber(payload.level) or 0), MIN_LEVEL, MAX_LEVEL)
+		if not (ax and az and bx and bz) then return false, "Bad points" end
+
+		local idxA, idxB = plotAtXZ(ax, az), plotAtXZ(bx, bz)
+		if not (idxA and idxA == idxB) then return false, "Stay on one plot" end
+		if not canBuild(player, idxA) then return false, "Roommates only!" end
+		if #getItemFolder(idxA):GetChildren() >= MAX_ITEMS then return false, "Item limit reached" end
+
+		local baseY = levelBaseY(idxA, level)
+		if action == "wall" then
+			local a, b = Vector3.new(ax, 0, az), Vector3.new(bx, 0, bz)
+			local length = (b - a).Magnitude
+			if length < 1 then return false, "Too short" end
+			if length > 120 then return false, "Too long" end
+			-- v9.1 CORNER SEWING: extend both ends by half the wall thickness
+			-- so two walls meeting at a corner close the outside notch instead
+			-- of leaving an L-shaped gap. Endpoints were validated above.
+			local axis = (b - a).Unit
+			a -= axis * (WALL_THICKNESS / 2)
+			b += axis * (WALL_THICKNESS / 2)
+			length = (b - a).Magnitude
+			-- A hair of height variance stops the coplanar TOP faces of the
+			-- overlapping corner blocks from z-fighting. <=0.004 studs is
+			-- invisible, and it persists through save/load like any size.
+			local jitter = (#getItemFolder(idxA):GetChildren() % 5) * 0.001
+			local mid = (a + b) / 2 + Vector3.new(0, baseY + (WALL_HEIGHT + jitter)/2, 0)
+			local cf = CFrame.lookAt(mid, Vector3.new(b.X, mid.Y, b.Z))
+			local m = spawnStructure(idxA, "w",
+				Vector3.new(WALL_THICKNESS, WALL_HEIGHT + jitter, length), cf)
+			applyStructStyle(m, payload.mat, payload.r, payload.g, payload.b, payload.t)
+			return true
+		else
+			-- Server-side grid enforcement keeps mouse, touch, and imported requests
+			-- aligned even if a client sends slightly imperfect coordinates.
+			local snap = (action == "roof") and math.clamp(tonumber(payload.roofSnap) or 1, 0.25, 4) or GRID
+			local plot = plots[idxA]
+			local function snapXZ(x, z)
+				local rel = plot.CFrame:PointToObjectSpace(Vector3.new(x, plot.Position.Y, z))
+				local localPoint = Vector3.new(math.round(rel.X / snap) * snap, rel.Y, math.round(rel.Z / snap) * snap)
+				local world = plot.CFrame:PointToWorldSpace(localPoint)
+				return world.X, world.Z
+			end
+			ax, az = snapXZ(ax, az)
+			bx, bz = snapXZ(bx, bz)
+
+			local minX, maxX = math.min(ax, bx), math.max(ax, bx)
+			local minZ, maxZ = math.min(az, bz), math.max(az, bz)
+			local kind = (action == "roof") and "r" or "f"
+			local overhang = (kind == "r") and math.clamp(tonumber(payload.overhang) or 0, 0, 4) or 0
+			minX, maxX = minX - overhang, maxX + overhang
+			minZ, maxZ = minZ - overhang, maxZ + overhang
+			local sx, sz = maxX - minX, maxZ - minZ
+			if sx < 1 or sz < 1 then return false, "Too small" end
+			if sx > 128 or sz > 128 then return false, "Too big" end
+
+			local thick = (kind == "r") and 0.6 or FLOOR_THICKNESS
+			local verticalOffset = (kind == "r") and math.clamp(tonumber(payload.verticalOffset) or -0.08, -1, 1) or 0
+			local baseTop = baseY + WALL_HEIGHT + verticalOffset
+			local y = (kind == "r") and (baseTop + thick / 2) or (baseY + thick / 2 + 0.05)
+			local midX, midZ = (minX + maxX) / 2, (minZ + maxZ) / 2
+			local roofRotation = (math.round((tonumber(payload.roofRotation) or 0) / 90) * 90) % 180
+
+			----------------------------------------------------------------
+			-- SHAPED ROOFS: build at the origin exactly like the client preview,
+			-- then rotate and move the complete result into the plot. This fixes
+			-- the old mismatch where Turn/Edge/Grid changed the preview only.
+			----------------------------------------------------------------
+			local shape = tostring(payload.shape or "flat")
+			if kind == "r" and shape ~= "flat" and RoofShapes then
+				local buildX, buildZ = sx, sz
+				if roofRotation == 90 then buildX, buildZ = sz, sx end
+				local pitch = math.clamp(tonumber(payload.pitch) or 1, 0.4, 2.2)
+				local rise = math.clamp(math.min(buildX, buildZ) * 0.35 * pitch, 1, 14)
+				local pieces = RoofShapes.Build(shape, Vector3.zero, buildX, buildZ, rise)
+				if #pieces == 0 then return false, "Unknown roof style" end
+
+				local boundsCF = CFrame.new(midX, baseTop + rise / 2, midZ)
+				local boundsSize = Vector3.new(sx, math.max(rise, 0.6), sz)
+				if overlapsSameKind(idxA, "r", boundsCF, boundsSize) then
+					return false, "Overlaps another roof!"
+				end
+
+				local roofWorld = CFrame.new(midX, baseTop, midZ) * CFrame.Angles(0, math.rad(roofRotation), 0)
+				for _, piece in ipairs(pieces) do
+					local m = spawnStructure(idxA, "r", piece.size, roofWorld * piece.cf, nil, nil, piece.wedge)
+					applyStructStyle(m, payload.mat, payload.r, payload.g, payload.b, payload.t)
+				end
+				print("[Roof] built " .. shape .. " roof (" .. math.floor(sx) .. "x"
+					.. math.floor(sz) .. ", grid " .. snap .. ", edge " .. overhang
+					.. ", turn " .. roofRotation .. "°)")
+				return true
+			end
+
+			local slabCF = CFrame.new(midX, y, midZ) * CFrame.Angles(0, math.rad(roofRotation), 0)
+			local slabSize = Vector3.new(sx, thick, sz)
+			if overlapsSameKind(idxA, kind, slabCF, slabSize) then
+				return false, (kind == "r") and "Overlaps another roof!" or "Overlaps another floor!"
+			end
+			local m = spawnStructure(idxA, kind, slabSize, slabCF)
+			applyStructStyle(m, payload.mat, payload.r, payload.g, payload.b, payload.t)
+			return true
+		end
+
+		----------------------------------------------------------------
+	elseif action == "cutout" then -- carve a door/window opening in a wall
+		local model, idx = resolvePlacedModel(payload.target)
+		if not (model and model.Name == "__Wall") then return false, "Click a wall" end
+		if not (idx and canBuild(player, idx)) then return false, "Roommates only!" end
+		local part = model.PrimaryPart
+		if not part then return false, "Broken wall" end
+		local hx = tonumber(payload.x)
+		local hy = tonumber(payload.y)
+		local hz = tonumber(payload.z)
+		if not (hx and hy and hz) then return false, "Bad point" end
+
+		local H = part.Size.Y
+		local rel = part.CFrame:PointToObjectSpace(Vector3.new(hx, hy, hz))
+		local isDoor = (payload.kind == "door")
+		local openBottom = isDoor and 0 or math.min(3, H - 2)
+		local openTop = math.min(7, H - 0.5)
+		if openTop <= openBottom then return false, "Wall too low" end
+		if not cutOpening(idx, model, rel.Z, openBottom, openTop, 4) then
+			return false, "Wall too short for that"
+		end
+		return true
+
+		----------------------------------------------------------------
+	elseif action == "transform" then -- move/rotate/scale via select tool
+		local model, idx = resolvePlacedModel(payload.target)
+		if not model then return false, "Not a placed item" end
+		if not (idx and canBuild(player, idx)) then return false, "Roommates only!" end
+		if type(payload.x) ~= "number" or type(payload.y) ~= "number"
+			or type(payload.z) ~= "number" or type(payload.rot) ~= "number" then
+			return false, "Bad transform"
+		end
+		local pos = Vector3.new(payload.x, payload.y, payload.z)
+		if plotAtPosition(pos) ~= idx then return false, "Keep it on the plot!" end
+
+		-- 15-degree granularity so the client's 15/45/90 snap options all
+		-- survive validation
+		local rot = math.rad(math.round(math.deg(payload.rot) / 15) * 15)
+		local rx = math.rad(math.round(math.deg(tonumber(payload.rx) or 0) / 15) * 15)
+		local rz = math.rad(math.round(math.deg(tonumber(payload.rz) or 0) / 15) * 15)
+		local prevPivot = model:GetPivot()
+		model:PivotTo(CFrame.new(pos) * CFrame.fromOrientation(rx, rot, rz))
+
+		-- Full bounding-box check: revert if any part of it left the plot
+		local bcf, bsize = model:GetBoundingBox()
+		if not boxWithinPlot(idx, bcf, bsize) then
+			model:PivotTo(prevPivot)
+			return false, "Keep it inside your plot!"
+		end
+
+		if not STRUCT_KIND[model.Name] and type(payload.scale) == "number" then
+			pcall(function()
+				model:ScaleTo(math.clamp(payload.scale, SCALE_MIN, SCALE_MAX))
+			end)
+		end
+		return true
+
+		----------------------------------------------------------------
+	elseif action == "resize" then -- structures only
+		local model, idx = resolvePlacedModel(payload.target)
+		if not model then return false, "Not a placed item" end
+		if not STRUCT_KIND[model.Name] then return false, "Only walls/floors resize" end
+		if not (idx and canBuild(player, idx)) then return false, "Roommates only!" end
+		local part = model.PrimaryPart
+		if not part then return false, "Broken structure" end
+		local sx = math.clamp(tonumber(payload.sx) or part.Size.X, 0.4, 120)
+		local sy = math.clamp(tonumber(payload.sy) or part.Size.Y, 0.4, 24)
+		local sz = math.clamp(tonumber(payload.sz) or part.Size.Z, 0.4, 120)
+		local pos = Vector3.new(tonumber(payload.x) or part.Position.X,
+			tonumber(payload.y) or part.Position.Y,
+			tonumber(payload.z) or part.Position.Z)
+		if plotAtXZ(pos.X, pos.Z) ~= idx then return false, "Keep it on the plot!" end
+		local rot = tonumber(payload.rot) or 0
+		local prx = math.rad(math.round(math.deg(tonumber(payload.rx) or 0) / 15) * 15)
+		local prz = math.rad(math.round(math.deg(tonumber(payload.rz) or 0) / 15) * 15)
+		local newCF = CFrame.new(pos) * CFrame.fromOrientation(prx, rot, prz)
+		if not boxWithinPlot(idx, newCF, Vector3.new(sx, sy, sz)) then
+			return false, "Keep it inside your plot!"
+		end
+		part.Size = Vector3.new(sx, sy, sz)
+		part.CFrame = newCF
+		reapplyTrim(model) -- refit both faces to the new length
+		return true
+
+		----------------------------------------------------------------
+	elseif action == "slots" then -- list save slots
+		if not d then return false, "Loading..." end
+		local idx = playerPlot[player]
+		local maxN = maxSlots(player)
+		local counts = {}
+		for i = 1, maxN do
+			if idx and i == d.cur then
+				counts[i] = #getItemFolder(idx):GetChildren()
+			else
+				counts[i] = d.slots[i] and #d.slots[i] or 0
+			end
+		end
+		return true, { cur = d.cur, max = maxN, counts = counts }
+
+		----------------------------------------------------------------
+	elseif action == "loadslot" then -- switch to another saved layout
+		if not d then return false, "Loading..." end
+		if not d.loaded then return false, "Save data still loading" end
+		local idx = playerPlot[player]
+		if not idx then return false, "Claim a plot first" end
+		if claims[idx] ~= player then return false, "Owner only" end
+		local slot = math.floor(tonumber(payload.slot) or 0)
+		if slot < 1 or slot > maxSlots(player) then return false, "Invalid slot" end
+		if slot == d.cur then return false, "Already on that slot" end
+
+		-- stash the current build, wipe the plot, rebuild the chosen slot
+		d.slots[d.cur] = serializePlot(idx)
+		getItemFolder(idx):ClearAllChildren()
+		d.cur = slot
+		for _, e in ipairs(d.slots[slot] or {}) do
+			rebuildEntry(idx, e)
+		end
+		return true
+
+		----------------------------------------------------------------
+	elseif action == "roofpoly" then -- roof traced from points
+		if not RoofShapes then return false, "Roof module missing" end
+		local pts = payload.points
+		if type(pts) ~= "table" or #pts < 3 or #pts > 16 then
+			return false, "Trace 3-16 points"
+		end
+
+		-- every point must sit on ONE plot the player may build on
+		local idx = nil
+		local world = {}
+		for _, p in ipairs(pts) do
+			local px, pz = tonumber(p.x), tonumber(p.z)
+			if not (px and pz) then return false, "Bad point" end
+			local at = plotAtXZ(px, pz)
+			if not at then return false, "Trace stays on your plot" end
+			if idx and at ~= idx then return false, "Trace stays on one plot" end
+			idx = at
+			table.insert(world, Vector3.new(px, 0, pz))
+		end
+		if not canBuild(player, idx) then return false, "Roommates only!" end
+		if #getItemFolder(idx):GetChildren() >= MAX_ITEMS then return false, "Item limit reached" end
+
+		local level = math.clamp(math.floor(tonumber(payload.level) or 0), MIN_LEVEL, MAX_LEVEL)
+		local roofSnap = math.clamp(tonumber(payload.roofSnap) or 1, 0.25, 4)
+		local overhang = math.clamp(tonumber(payload.overhang) or 0, 0, 4)
+		local verticalOffset = math.clamp(tonumber(payload.verticalOffset) or -0.08, -1, 1)
+		local plot = plots[idx]
+		for i, point in ipairs(world) do
+			local rel = plot.CFrame:PointToObjectSpace(Vector3.new(point.X, plot.Position.Y, point.Z))
+			local snapped = plot.CFrame:PointToWorldSpace(Vector3.new(
+				math.round(rel.X / roofSnap) * roofSnap, rel.Y,
+				math.round(rel.Z / roofSnap) * roofSnap))
+			world[i] = Vector3.new(snapped.X, 0, snapped.Z)
+		end
+		if overhang > 0 then
+			local center = Vector3.zero
+			for _, point in ipairs(world) do center += point end
+			center /= #world
+			for i, point in ipairs(world) do
+				local delta = point - center
+				if delta.Magnitude > 0.001 then world[i] = point + delta.Unit * overhang end
+			end
+		end
+		local baseTop = levelBaseY(idx, level) + WALL_HEIGHT + verticalOffset
+		local pitch = math.clamp(tonumber(payload.pitch) or 1, 0.4, 2.2)
+
+		-- size the rise from the outline's span
+		local minX, maxX = math.huge, -math.huge
+		local minZ, maxZ = math.huge, -math.huge
+		for _, p in ipairs(world) do
+			minX, maxX = math.min(minX, p.X), math.max(maxX, p.X)
+			minZ, maxZ = math.min(minZ, p.Z), math.max(maxZ, p.Z)
+		end
+		local span = math.min(maxX - minX, maxZ - minZ)
+		if span < 2 then return false, "Outline too small" end
+		local rise = math.clamp(span * 0.35 * pitch, 1, 14)
+
+		local pieces = RoofShapes.BuildPolygon(world, baseTop, rise, tostring(payload.shape or "hip"))
+		if #pieces == 0 then return false, "Couldn't build that outline" end
+		for _, piece in ipairs(pieces) do
+			local m = spawnStructure(idx, "r", piece.size, piece.cf, nil, nil, piece.wedge)
+			applyStructStyle(m, payload.mat, payload.r, payload.g, payload.b, payload.t)
+		end
+		print("[Roof] traced roof: " .. #world .. " points, " .. #pieces .. " pieces")
+		return true
+
+		----------------------------------------------------------------
+	elseif action == "clone" then -- duplicate a placed item at an offset
+		local model, idx = resolvePlacedModel(payload.target)
+		if not model then return false, "Not a placed item" end
+		if not (idx and canBuild(player, idx)) then return false, "Roommates only!" end
+		if #getItemFolder(idx):GetChildren() >= MAX_ITEMS then return false, "Item limit reached" end
+
+		-- The client can pass the exact spot it wants the copy (this is
+		-- what makes duplicating a duplicate land on the DUPLICATE and
+		-- not back at the original).
+		local newCF
+		if tonumber(payload.x) and tonumber(payload.y) and tonumber(payload.z) then
+			local rx = tonumber(payload.rx) or 0
+			local ry = tonumber(payload.rot) or 0
+			local rz = tonumber(payload.rz) or 0
+			newCF = CFrame.new(payload.x, payload.y, payload.z) * CFrame.fromOrientation(rx, ry, rz)
+		else
+			local dx = tonumber(payload.dx) or 0
+			local dz = tonumber(payload.dz) or 0
+			newCF = model:GetPivot() + Vector3.new(dx, 0, dz)
+		end
+		if plotAtPosition(newCF.Position) ~= idx then
+			return false, "Copy would leave the plot"
+		end
+
+		local _, bsize = model:GetBoundingBox()
+		if not boxWithinPlot(idx, newCF, bsize) then
+			return false, "Copy would leave the plot"
+		end
+
+		if STRUCT_KIND[model.Name] then
+			local part = model.PrimaryPart
+			if not part then return false, "Broken structure" end
+			local structCF = newCF
+			if not (tonumber(payload.x) and tonumber(payload.y) and tonumber(payload.z)) then
+				structCF = part.CFrame + (newCF.Position - model:GetPivot().Position)
+			end
+			-- v9.3: a copied WALL re-snaps its centre to the grid and keeps the
+			-- same sewn length, so it stitches into corners exactly like a
+			-- freshly-drawn wall instead of inheriting a stale offset.
+			local copySize = part.Size
+			if model.Name == "__Wall" then
+				local pl = plots[idx]
+				local rel = pl.CFrame:PointToObjectSpace(structCF.Position)
+				local snapped = Vector3.new(
+					math.round(rel.X / GRID) * GRID, rel.Y,
+					math.round(rel.Z / GRID) * GRID)
+				structCF = pl.CFrame:ToWorldSpace(CFrame.new(snapped)) * structCF.Rotation
+			end
+			local copy = spawnStructure(idx, STRUCT_KIND[model.Name], copySize,
+				structCF, part.Material.Name, part.Color,
+				part:IsA("WedgePart"))
+			if copy and copy.PrimaryPart then
+				copy.PrimaryPart.Transparency = part.Transparency
+			end
+			for _, key in ipairs({ "TrimA", "TrimB", "TrimColorA", "TrimColorB",
+				"TrimMatA", "TrimMatB", "TrimTransA", "TrimTransB" }) do
+				copy:SetAttribute(key, model:GetAttribute(key))
+			end
+			reapplyTrim(copy)
+			return true, copy
+		end
+
+		local price = priceOf(model.Name)
+		if price > 0 then
+			if not spendCurrency(player, price) then
+				return false, "Not enough " .. CURRENCY_PLURAL .. "! (" .. price .. ")"
+			end
+		end
+		-- trust the client's reported scale when it sends one (the model
+		-- may have been resized after it was placed), else read it back
+		local scale = tonumber(payload.scale)
+		if not scale then
+			scale = 1
+			pcall(function() scale = model:GetScale() end)
+		end
+		local copy = spawnItem(idx, model.Name, newCF, scale)
+		if not copy then return false, "Copy failed" end
+		copy:SetAttribute("PlacedBy", player.UserId)
+
+		-- carry over any per-part paint job so the copy matches exactly
+		-- (deliberately NOT copying OpenCF/OpenSize: a copy doesn't own
+		-- the original's wall opening)
+		if model:GetAttribute("Painted") then
+			local srcParts, dstParts = {}, {}
+			for _, p in ipairs(model:GetDescendants()) do
+				if p:IsA("BasePart") then table.insert(srcParts, p) end
+			end
+			for _, p in ipairs(copy:GetDescendants()) do
+				if p:IsA("BasePart") then table.insert(dstParts, p) end
+			end
+			for i, dst in ipairs(dstParts) do
+				local src = srcParts[i]
+				if src then
+					dst.Color = src.Color
+					dst.Material = src.Material
+					dst.Transparency = src.Transparency
+				end
+			end
+			copy:SetAttribute("Painted", true)
+		end
+		return true, copy
+
+		----------------------------------------------------------------
+	elseif action == "save" then -- force a save right now
+		if not playerPlot[player] then return false, "You don't own a plot" end
+		saveData(player, "manual save")
+		local dd = playerData[player]
+		if dd and not dd.loaded then return false, "Save unavailable (DataStore offline)" end
+		return true, #(dd.slots[dd.cur] or {})
+
+		----------------------------------------------------------------
+	elseif action == "bulldoze" then -- clear the whole plot (owner only)
+		local idx = playerPlot[player]
+		if not idx then return false, "You don't own a plot" end
+		if claims[idx] ~= player then return false, "Owner only" end
+		local folder = getItemFolder(idx)
+		local count = #folder:GetChildren()
+		folder:ClearAllChildren()
+		return true, count
+
+		----------------------------------------------------------------
+	elseif action == "light" then -- place a light fitting (costs currency)
+		if type(payload.x) ~= "number" or type(payload.y) ~= "number"
+			or type(payload.z) ~= "number" then
+			return false, "Bad position"
+		end
+		local pos = Vector3.new(payload.x, payload.y, payload.z)
+		local idx = plotAtPosition(pos)
+		if not idx then return false, "Outside any plot" end
+		if not canBuild(player, idx) then return false, "Roommates only!" end
+		if #getItemFolder(idx):GetChildren() >= MAX_ITEMS then return false, "Item limit reached" end
+		if not spendCurrency(player, LIGHT_COST) then
+			return false, "Not enough " .. CURRENCY_PLURAL .. "! (" .. LIGHT_COST .. ")"
+		end
+
+		local r, g, b = tonumber(payload.r), tonumber(payload.g), tonumber(payload.b)
+		local colour = (r and g and b)
+			and Color3.new(math.clamp(r,0,1), math.clamp(g,0,1), math.clamp(b,0,1))
+			or nil
+		spawnLight(idx, CFrame.new(pos), colour, payload.bright, payload.range,
+			tostring(payload.kind or "point"), payload.size)
+		return true, LIGHT_COST
+
+		----------------------------------------------------------------
+	elseif action == "trim" then -- add/change/remove trim on a wall
+		local model, idx = resolvePlacedModel(payload.target)
+		if not model then return false, "Not a placed item" end
+		if model.Name ~= "__Wall" then return false, "Trim goes on walls" end
+		if not (idx and canBuild(player, idx)) then return false, "Roommates only!" end
+
+		local style = tostring(payload.style or "none")
+		if TRIM_STYLES[style] == nil then return false, "Unknown trim style" end
+		local colour = nil
+		local r, g, b = tonumber(payload.r), tonumber(payload.g), tonumber(payload.b)
+		if r and g and b then
+			colour = Color3.new(math.clamp(r,0,1), math.clamp(g,0,1), math.clamp(b,0,1))
+		end
+		-- which face did they click? the client sends the side it hit
+		local side = (tonumber(payload.side) or 1) >= 0 and 1 or -1
+		applyTrim(model, style, colour, side,
+			tostring(payload.mat or ""), tonumber(payload.t))
+		return true
+
+		----------------------------------------------------------------
+	elseif action == "paint" then -- structures AND furniture (per part)
+		local model, idx = resolvePlacedModel(payload.target)
+		if not model then return false, "Not a placed item" end
+		if not (idx and canBuild(player, idx)) then return false, "Roommates only!" end
+
+		if STRUCT_KIND[model.Name] then
+			local clicked = payload.part
+			if typeof(clicked) == "Instance" and clicked:IsA("BasePart")
+				and clicked:IsDescendantOf(model) and clicked.Name == "Trim" then
+				local side = (tonumber(clicked:GetAttribute("Side")) or 1) >= 0 and 1 or -1
+				local styleKey = (side == 1) and "TrimA" or "TrimB"
+				local currentStyle = model:GetAttribute(styleKey)
+				if currentStyle and currentStyle ~= "none" then
+					local r, g, b = tonumber(payload.r), tonumber(payload.g), tonumber(payload.b)
+					local colour = (r and g and b)
+						and Color3.new(math.clamp(r,0,1), math.clamp(g,0,1), math.clamp(b,0,1))
+						or clicked.Color
+					applyTrim(model, currentStyle, colour, side,
+						tostring(payload.mat or clicked.Material.Name), tonumber(payload.t))
+					return true
+				end
+			end
+			-- Clicking the actual wall/floor/roof body changes only that body;
+			-- trim remains an independently paintable child.
+			applyStructStyle(model, payload.mat, payload.r, payload.g, payload.b, payload.t)
+			return true
+		end
+
+		-- Furniture: paint the exact part that was clicked
+		local part = payload.part
+		if typeof(part) ~= "Instance" or not part:IsA("BasePart")
+			or not part:IsDescendantOf(model) then
+			part = model.PrimaryPart
+		end
+		if not part then return false, "Nothing to paint" end
+		local mat = tostring(payload.mat)
+		if ALLOWED_MATERIALS[mat] then part.Material = Enum.Material[mat] end
+		local r, g, b = tonumber(payload.r), tonumber(payload.g), tonumber(payload.b)
+		if r and g and b then
+			part.Color = Color3.new(math.clamp(r,0,1), math.clamp(g,0,1), math.clamp(b,0,1))
+		end
+		local t = tonumber(payload.t)
+		if t then part.Transparency = math.clamp(t, 0, 0.9) end
+		model:SetAttribute("Painted", true) -- flags it for paint persistence
+		return true
+	end
+
+	return false, "Unknown action"
+end
+
+--------------------------------------------------------------------
+-- LIFECYCLE
+--------------------------------------------------------------------
+local function hookPlayer(player)
+	playerData[player] = { inv = {}, slots = {}, cur = 1, cash = 0, spawned = false, loaded = false }
+	loadData(player)
+	player.CharacterAdded:Connect(function()
+		task.wait(0.4)
+		local idx = playerPlot[player]
+		if idx then teleportToPlot(player, idx) end
+	end)
+end
+
+Players.PlayerAdded:Connect(hookPlayer)
+for _, p in Players:GetPlayers() do hookPlayer(p) end
+
+Players.PlayerRemoving:Connect(function(player)
+	pendingInvites[player] = nil
+	lastTeleport[player] = nil
+	saveData(player, "player leaving")
+	local idx = playerPlot[player]
+	if idx then
+		claims[idx] = nil
+		playerPlot[player] = nil
+		members[idx] = nil
+		if plotItemFolders[idx] then plotItemFolders[idx]:ClearAllChildren() end
+		broadcast()
+	else
+		for i, set in pairs(members) do
+			if set[player] then set[player] = nil pushPartyStatus(i) end
+		end
+	end
+	playerData[player] = nil
+	slotAccessCache[player.UserId] = nil
+end)
+
+-- AUTOSAVE loop (markDirty is defined earlier, near the top, so the
+-- build handler can call it)
+task.spawn(function()
+	while true do
+		task.wait(15)
+		for player in pairs(dirty) do
+			if player.Parent and playerPlot[player] then
+				saveData(player, "autosave")
+			end
+			dirty[player] = nil
+		end
+	end
+end)
+
+-- belt and braces: a full pass every 2 minutes even without changes
+task.spawn(function()
+	while true do
+		task.wait(120)
+		for _, player in ipairs(Players:GetPlayers()) do
+			if playerPlot[player] then saveData(player, "periodic") end
+		end
+	end
+end)
+
+game:BindToClose(function()
+	for _, player in Players:GetPlayers() do saveData(player, "server closing") end
+end)
